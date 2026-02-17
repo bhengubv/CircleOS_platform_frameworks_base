@@ -7,6 +7,7 @@ package za.co.circleos.personality;
 
 import za.co.circleos.personality.PersonalityMode;
 import za.co.circleos.personality.SwitchResult;
+import za.co.circleos.personality.TriggerRule;
 import za.co.circleos.personality.IPersonalityCallback;
 
 interface ICirclePersonalityManager {
@@ -29,4 +30,14 @@ interface ICirclePersonalityManager {
     void triggerEmergencyBypass();
     void clearEmergencyBypass();
     boolean isEmergencyBypassActive();
+
+    // Phase 2: Auto-switch intelligence
+    void addTriggerRule(in TriggerRule rule);
+    void removeTriggerRule(String ruleId);
+    List<TriggerRule> getTriggerRules();
+    void setAutoSwitchEnabled(boolean enabled);
+    boolean isAutoSwitchEnabled();
+
+    // Phase 2: Notification broker
+    void dismissBrokerNotifications();
 }

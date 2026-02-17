@@ -18,26 +18,32 @@ import za.co.circleos.personality.ICirclePersonalityManager;
 import za.co.circleos.personality.IPersonalityCallback;
 import za.co.circleos.personality.PersonalityMode;
 import za.co.circleos.personality.SwitchResult;
+import za.co.circleos.personality.TriggerRule;
 
 /**
  * System service that manages CircleOS personality modes (profiles).
  *
  * <p>Registered as {@code "circle.personality"} in SystemServer. Apps acquire
- * the Binder via {@code ServiceManager.getService("circle.personality")} or the
- * {@code CirclePersonalityClient} helper library (Phase 4).</p>
+ * the Binder via {@code ServiceManager.getService("circle.personality")}.</p>
  *
- * <p>Phase 1 delivers: mode switching, Tier-1 mode definitions, basic
- * notification rules, emergency bypass, and a QS tile hook.</p>
+ * <p>Phase 1: mode switching, Tier-1 mode definitions, notification rules,
+ * emergency bypass, QS tile hook.</p>
+ * <p>Phase 2: auto-switch triggers, conflict resolver, notification broker,
+ * state preservation.</p>
  */
 public class CirclePersonalityManagerService extends SystemService {
 
-    private static final String TAG         = "CirclePersonality";
+    private static final String TAG          = "CirclePersonality";
     private static final String SERVICE_NAME = "circle.personality";
-    static final int SERVICE_VERSION = 1;
+    static final int SERVICE_VERSION = 2;
 
-    private HandlerThread mHandlerThread;
-    private Handler       mHandler;
-    private ModeManager   mModeManager;
+    private HandlerThread            mHandlerThread;
+    private Handler                  mHandler;
+    private ModeManager              mModeManager;
+    private ConflictResolver         mConflictResolver;
+    private AutoSwitchManager        mAutoSwitchManager;
+    private NotificationBroker       mNotifBroker;
+    private StatePreservationManager mStatePreservation;
 
     // -------------------------------------------------------------------------
     // Lifecycle wrapper — mirrors all existing Circle services
@@ -62,10 +68,6 @@ public class CirclePersonalityManagerService extends SystemService {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Constructor
-    // -------------------------------------------------------------------------
-
     public CirclePersonalityManagerService(Context context) {
         super(context);
     }
@@ -78,8 +80,17 @@ public class CirclePersonalityManagerService extends SystemService {
     public void onStart() {
         mHandlerThread = new HandlerThread("CirclePersonality");
         mHandlerThread.start();
-        mHandler     = new Handler(mHandlerThread.getLooper());
+        mHandler = new Handler(mHandlerThread.getLooper());
+
+        // Phase 2 components
+        mConflictResolver  = new ConflictResolver();
+        mNotifBroker       = new NotificationBroker(getContext());
+        mStatePreservation = new StatePreservationManager(getContext());
+        mAutoSwitchManager = new AutoSwitchManager();
+
+        // Core manager
         mModeManager = new ModeManager(getContext());
+        mModeManager.setPhase2Components(mNotifBroker, mStatePreservation);
 
         publishBinderService(SERVICE_NAME, mBinder);
         Log.i(TAG, "CirclePersonalityManagerService started (v" + SERVICE_VERSION + ")");
@@ -90,8 +101,10 @@ public class CirclePersonalityManagerService extends SystemService {
         if (phase == PHASE_BOOT_COMPLETED) {
             mHandler.post(() -> {
                 mModeManager.init();
-                Log.i(TAG, "Boot complete — mode restored: "
-                        + mModeManager.getActiveModeId());
+                mAutoSwitchManager.init(getContext(), mModeManager,
+                        mConflictResolver, mHandler);
+                Log.i(TAG, "Boot complete — mode: " + mModeManager.getActiveModeId()
+                        + ", auto-switch enabled: " + mAutoSwitchManager.isEnabled());
             });
         }
     }
@@ -102,6 +115,8 @@ public class CirclePersonalityManagerService extends SystemService {
 
     private final ICirclePersonalityManager.Stub mBinder =
             new ICirclePersonalityManager.Stub() {
+
+        // ---- Phase 1 --------------------------------------------------------
 
         @Override
         public PersonalityMode getActiveMode() {
@@ -132,7 +147,6 @@ public class CirclePersonalityManagerService extends SystemService {
         public SwitchResult activateMode(String modeId) {
             final SwitchResult[] result = new SwitchResult[1];
             mHandler.post(() -> result[0] = mModeManager.activateMode(modeId));
-            // Brief wait for synchronous-ish response on the handler
             try { Thread.sleep(50); } catch (InterruptedException ignored) {}
             return result[0] != null ? result[0] : SwitchResult.fail("Timeout");
         }
@@ -168,6 +182,42 @@ public class CirclePersonalityManagerService extends SystemService {
         @Override
         public boolean isEmergencyBypassActive() {
             return mModeManager.isEmergencyBypassActive();
+        }
+
+        // ---- Phase 2: auto-switch -------------------------------------------
+
+        @Override
+        public void addTriggerRule(TriggerRule rule) {
+            if (rule == null) return;
+            mHandler.post(() -> mAutoSwitchManager.addRule(rule));
+        }
+
+        @Override
+        public void removeTriggerRule(String ruleId) {
+            if (ruleId == null) return;
+            mHandler.post(() -> mAutoSwitchManager.removeRule(ruleId));
+        }
+
+        @Override
+        public List<TriggerRule> getTriggerRules() {
+            return mAutoSwitchManager.getRules();
+        }
+
+        @Override
+        public void setAutoSwitchEnabled(boolean enabled) {
+            mHandler.post(() -> mAutoSwitchManager.setEnabled(enabled));
+        }
+
+        @Override
+        public boolean isAutoSwitchEnabled() {
+            return mAutoSwitchManager.isEnabled();
+        }
+
+        // ---- Phase 2: notification broker -----------------------------------
+
+        @Override
+        public void dismissBrokerNotifications() {
+            mNotifBroker.dismissBrokerNotifications();
         }
     };
 }
