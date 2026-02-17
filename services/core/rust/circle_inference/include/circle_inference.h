@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * C ABI exported by the Rust circle_inference crate.
- * Used by circle_inference_jni.cpp to call into the Rust abstraction layer.
+ * Phase 3: adds circle_inference_backend_name().
  */
 #pragma once
 
@@ -15,27 +15,16 @@ extern "C" {
 #endif
 
 /**
- * Load a GGUF model file into the inference backend.
- *
- * @param model_path      Absolute path to the .gguf model file (UTF-8, null-terminated).
- * @param context_size    Context window in tokens. 0 = use model default.
- * @param memory_budget_mb Maximum memory the model may use, in MB.
- * @return Opaque handle > 0 on success; 0 on failure.
+ * Load a model using the auto-selected backend (BitNet or llama.cpp).
+ * Returns handle > 0 on success; 0 on failure.
  */
 int64_t circle_inference_load(const char* model_path,
                                int32_t context_size,
                                int32_t memory_budget_mb);
 
 /**
- * Generate text from a prompt.
- *
- * @param handle          Handle returned by circle_inference_load.
- * @param prompt          Input prompt (UTF-8, null-terminated).
- * @param max_tokens      Maximum tokens to generate.
- * @param temperature     Sampling temperature (0.0 = deterministic).
- * @param out_buf         Caller-allocated buffer to receive generated text (UTF-8).
- * @param out_buf_len     Size of out_buf in bytes.
- * @return Bytes written to out_buf (not counting null terminator), or -1 on error.
+ * Generate text. Writes UTF-8 result into out_buf (null-terminated).
+ * Returns bytes written, or -1 on error.
  */
 int32_t circle_inference_generate(int64_t handle,
                                    const char* prompt,
@@ -45,17 +34,23 @@ int32_t circle_inference_generate(int64_t handle,
                                    int32_t out_buf_len);
 
 /**
- * Unload the model associated with handle and free all native resources.
- *
- * @param handle Handle returned by circle_inference_load.
+ * Unload the model and free all native resources.
  */
 void circle_inference_unload(int64_t handle);
 
 /**
- * Returns 1 if the native inference backend is compiled and available;
- * 0 if running in stub/placeholder mode (Phase 1-2 without llama.cpp linked).
+ * Returns 1 if a native backend is compiled in; 0 for stub mode.
  */
 int32_t circle_inference_is_native_available(void);
+
+/**
+ * Writes the active backend name ("llama.cpp" or "bitnet.cpp") for
+ * the given handle into out_buf. Returns bytes written, or -1 on error.
+ * Phase 3+.
+ */
+int32_t circle_inference_backend_name(int64_t handle,
+                                       char* out_buf,
+                                       int32_t out_buf_len);
 
 #ifdef __cplusplus
 }
