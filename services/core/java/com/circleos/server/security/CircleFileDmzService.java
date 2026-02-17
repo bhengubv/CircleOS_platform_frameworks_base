@@ -41,6 +41,7 @@ public class CircleFileDmzService extends SystemService {
     private QuarantineManager     mQuarantineManager;
     private CommunityDefenseService mCommunityDefense;
     private ResearcherApiService  mResearcherApi;
+    private com.circleos.server.compression.CircleCompressionService mCompressionService;
     private HandlerThread         mWorkerThread;
     private android.os.Handler    mWorkerHandler;
 
@@ -91,6 +92,7 @@ public class CircleFileDmzService extends SystemService {
             mCommunityDefense   = new CommunityDefenseService(getContext());
             mResearcherApi      = new ResearcherApiService(getContext());
             mQuarantineManager.setResearcherApi(mResearcherApi);
+            mCompressionService = new com.circleos.server.compression.CircleCompressionService(getContext());
 
             // Kick off initial feed update
             mWorkerHandler.post(() -> {
@@ -230,6 +232,31 @@ public class CircleFileDmzService extends SystemService {
                 result.verdict = sandboxResult.suspiciousActivity
                         ? DmzAnalysisResult.VERDICT_SUSPICIOUS
                         : DmzAnalysisResult.VERDICT_CLEAN;
+            }
+
+            // Stage 4: Compression — runs on all clean/sanitized inbound files
+            if (mCompressionService != null
+                    && (result.verdict == DmzAnalysisResult.VERDICT_CLEAN
+                     || result.verdict == DmzAnalysisResult.VERDICT_SANITIZED
+                     || result.verdict == DmzAnalysisResult.VERDICT_SUSPICIOUS)) {
+                java.io.File cdrOutput = mCdrProcessor.getSanitizedFile(sessionId);
+                if (cdrOutput != null && cdrOutput.exists()) {
+                    java.io.File compOut = new java.io.File(
+                            cdrOutput.getParent(), sessionId + ".compressed");
+                    za.co.circleos.compression.CompressionResult cr =
+                            mCompressionService.compressDirect(
+                                    cdrOutput, compOut, mimeType,
+                                    za.co.circleos.compression.CompressionRequest.TIER_VISUALLY_LOSSLESS,
+                                    za.co.circleos.compression.CompressionRequest.DIRECTION_INBOUND);
+                    if (cr.status == za.co.circleos.compression.CompressionResult.STATUS_OK) {
+                        result.findings.add("Compressed: " + cr.originalBytes
+                                + " → " + cr.compressedBytes
+                                + " bytes (" + cr.savingsPercent + "% saved, method=" + cr.method + ")");
+                        // Replace CDR output with compressed version
+                        compOut.renameTo(cdrOutput);
+                        result.hasSanitizedVersion = true;
+                    }
+                }
             }
 
         } catch (Exception e) {

@@ -2132,6 +2132,8 @@
         android:protectionLevel="normal" />
     <permission android:name="com.circleos.permission.RESEARCHER_API"
         android:protectionLevel="signature|privileged" />
+    <permission android:name="com.circleos.permission.ACCESS_COMPRESSION"
+        android:protectionLevel="normal" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
