@@ -49,11 +49,12 @@ class AutoSwitchManager {
     /** Calendar poll interval: 5 minutes. */
     private static final long CALENDAR_POLL_MS = 5 * 60 * 1000L;
 
-    private Context          mContext;
-    private ModeManager      mModeManager;
-    private ConflictResolver mResolver;
-    private Handler          mHandler;
-    private AlarmManager     mAlarmManager;
+    private Context           mContext;
+    private ModeManager       mModeManager;
+    private ConflictResolver  mResolver;
+    private Handler           mHandler;
+    private AlarmManager      mAlarmManager;
+    private AutoSwitchLearner mLearner; // Phase 5 — may be null
 
     private final Map<String, TriggerRule> mRules   = new ArrayMap<>();
     private boolean                         mEnabled = true;
@@ -80,6 +81,10 @@ class AutoSwitchManager {
             }
         }
     };
+
+    void setLearner(AutoSwitchLearner learner) {
+        mLearner = learner;
+    }
 
     void init(Context context, ModeManager modeManager,
               ConflictResolver resolver, Handler handler) {
@@ -325,6 +330,7 @@ class AutoSwitchManager {
                 Collections.singletonList(rule),
                 mModeManager.isEmergencyBypassActive());
         if (r != null) {
+            if (mLearner != null) mLearner.recordAutoSwitch(r.targetModeId);
             mHandler.post(() -> mModeManager.activateMode(r.targetModeId));
         }
     }

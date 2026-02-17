@@ -17,6 +17,8 @@ import java.util.List;
 import za.co.circleos.personality.IBundleCallback;
 import za.co.circleos.personality.ICirclePersonalityManager;
 import za.co.circleos.personality.IPersonalityCallback;
+import za.co.circleos.personality.LearningSuggestion;
+import za.co.circleos.personality.ManagedModePolicy;
 import za.co.circleos.personality.ModeBundle;
 import za.co.circleos.personality.PersonalityMode;
 import za.co.circleos.personality.SwitchResult;
@@ -29,12 +31,13 @@ import za.co.circleos.personality.TriggerRule;
  * Phase 2: auto-switch triggers, conflict resolver, notification broker, state preservation.
  * Phase 3: custom mode CRUD, import/export, per-mode app visibility.
  * Phase 4: Tier-2 lifestyle modes, download-on-activation bundle flow.
+ * Phase 5: Managed modes, auto-switch learning, Tier-3 modes, community sharing.
  */
 public class CirclePersonalityManagerService extends SystemService {
 
     private static final String TAG          = "CirclePersonality";
     private static final String SERVICE_NAME = "circle.personality";
-    static final int SERVICE_VERSION = 4;
+    static final int SERVICE_VERSION = 5;
 
     private HandlerThread            mHandlerThread;
     private Handler                  mHandler;
@@ -50,6 +53,10 @@ public class CirclePersonalityManagerService extends SystemService {
     // Phase 4
     private BundleStateStore         mBundleStateStore;
     private BundleDownloadManager    mBundleDownloadManager;
+    // Phase 5
+    private ManagedModeManager       mManagedModeManager;
+    private AutoSwitchLearner        mLearner;
+    private CommunityShareManager    mCommunityShare;
 
     // ---- Lifecycle wrapper --------------------------------------------------
 
@@ -89,11 +96,17 @@ public class CirclePersonalityManagerService extends SystemService {
         mBundleStateStore      = new BundleStateStore();
         mBundleDownloadManager = new BundleDownloadManager(mBundleStateStore);
 
+        // Phase 5
+        mManagedModeManager = new ManagedModeManager();
+        mLearner            = new AutoSwitchLearner();
+        mCommunityShare     = new CommunityShareManager();
+
         // Core manager — inject all components
         mModeManager = new ModeManager(getContext());
         mModeManager.setPhase2Components(mNotifBroker, mStatePreservation);
         mModeManager.setPhase3Components(mCustomStore, mAppVisibility);
         mModeManager.setPhase4Components(mBundleDownloadManager);
+        mModeManager.setPhase5Components(mManagedModeManager, mLearner, mCommunityShare);
 
         publishBinderService(SERVICE_NAME, mBinder);
         Log.i(TAG, "CirclePersonalityManagerService started (v" + SERVICE_VERSION + ")");
@@ -104,6 +117,7 @@ public class CirclePersonalityManagerService extends SystemService {
         if (phase == PHASE_BOOT_COMPLETED) {
             mHandler.post(() -> {
                 mModeManager.init();
+                mAutoSwitchManager.setLearner(mLearner); // Phase 5
                 mAutoSwitchManager.init(getContext(), mModeManager, mConflictResolver, mHandler);
                 Log.i(TAG, "Boot complete — mode: " + mModeManager.getActiveModeId());
             });
@@ -232,6 +246,96 @@ public class CirclePersonalityManagerService extends SystemService {
         @Override public List<String> getBundleApps(String modeId) {
             if (modeId == null) return new java.util.ArrayList<>();
             return mBundleDownloadManager.getBundleApps(modeId);
+        }
+
+        // Phase 5: Managed modes ----
+
+        @Override
+        public SwitchResult setManagedModePolicy(ManagedModePolicy policy) {
+            if (policy == null) return SwitchResult.fail("Null policy");
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.setManagedModePolicy(policy));
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
+        }
+
+        @Override
+        public void clearManagedModePolicy(String modeId) {
+            if (modeId != null) mHandler.post(() -> mModeManager.clearManagedModePolicy(modeId));
+        }
+
+        @Override
+        public ManagedModePolicy getManagedModePolicy(String modeId) {
+            return modeId != null ? mModeManager.getManagedModePolicy(modeId) : null;
+        }
+
+        @Override
+        public SwitchResult activateManagedMode(String modeId, String pin) {
+            if (modeId == null) return SwitchResult.fail("Null modeId");
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.activateManagedMode(modeId, pin));
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
+        }
+
+        @Override
+        public boolean isManagedModeActive() {
+            return mModeManager.isManagedModeActive();
+        }
+
+        // Phase 5: Auto-switch learning ----
+
+        @Override
+        public List<LearningSuggestion> getLearningSuggestions() {
+            return mModeManager.getLearningSuggestions();
+        }
+
+        @Override
+        public void acceptLearningSuggestion(String suggestionId) {
+            if (suggestionId == null) return;
+            // Capture rule before accepting so we can add it as a trigger rule
+            List<LearningSuggestion> suggestions = mModeManager.getLearningSuggestions();
+            for (LearningSuggestion sug : suggestions) {
+                if (suggestionId.equals(sug.id) && sug.suggestedRule != null) {
+                    mHandler.post(() -> mAutoSwitchManager.addRule(sug.suggestedRule));
+                    break;
+                }
+            }
+            mHandler.post(() -> mModeManager.acceptLearningSuggestion(suggestionId));
+        }
+
+        @Override
+        public void dismissLearningSuggestion(String suggestionId) {
+            if (suggestionId != null) mHandler.post(() -> mModeManager.dismissLearningSuggestion(suggestionId));
+        }
+
+        @Override
+        public SwitchResult undoLastSwitch() {
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.undoLastSwitch());
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
+        }
+
+        // Phase 5: Community sharing ----
+
+        @Override
+        public String getModeShareUrl(String modeId) {
+            return modeId != null ? mModeManager.getModeShareUrl(modeId) : null;
+        }
+
+        @Override
+        public SwitchResult importModeFromUrl(String url) {
+            if (url == null) return SwitchResult.fail("Null URL");
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.importModeFromUrl(url));
+            try { Thread.sleep(5000); } catch (InterruptedException ignored) {} // network call
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
+        }
+
+        @Override
+        public List<PersonalityMode> fetchCommunityModes() {
+            return mModeManager.fetchCommunityModes();
         }
     };
 }

@@ -12,6 +12,8 @@ import za.co.circleos.personality.AppRule;
 import za.co.circleos.personality.IPersonalityCallback;
 import za.co.circleos.personality.ModeBundle;
 import za.co.circleos.personality.IBundleCallback;
+import za.co.circleos.personality.ManagedModePolicy;
+import za.co.circleos.personality.LearningSuggestion;
 
 interface ICirclePersonalityManager {
     // Query
@@ -65,4 +67,22 @@ interface ICirclePersonalityManager {
     void cancelBundleDownload(String modeId);
     boolean isBundleDownloaded(String modeId);
     List<String> getBundleApps(String modeId);
+
+    // Phase 5: Managed modes (parental / enterprise PIN-lock)
+    SwitchResult setManagedModePolicy(in ManagedModePolicy policy);
+    void clearManagedModePolicy(String modeId);
+    ManagedModePolicy getManagedModePolicy(String modeId);
+    SwitchResult activateManagedMode(String modeId, String pin);
+    boolean isManagedModeActive();
+
+    // Phase 5: Auto-switch learning
+    List<LearningSuggestion> getLearningSuggestions();
+    void acceptLearningSuggestion(String suggestionId);
+    void dismissLearningSuggestion(String suggestionId);
+    SwitchResult undoLastSwitch();
+
+    // Phase 5: Community sharing
+    String getModeShareUrl(String modeId);
+    SwitchResult importModeFromUrl(String url);
+    List<PersonalityMode> fetchCommunityModes();
 }

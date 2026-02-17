@@ -26,7 +26,8 @@ import za.co.circleos.personality.SwitchResult;
  * Core mode management: switching, stack, emergency bypass, callbacks,
  * Phase 2 (notification broker, state preservation),
  * Phase 3 (custom modes, import/export, app visibility),
- * Phase 4 (Tier-2 bundle gating).
+ * Phase 4 (Tier-2 bundle gating),
+ * Phase 5 (managed modes, auto-switch learning, Tier-3 modes, community sharing).
  */
 class ModeManager {
 
@@ -48,6 +49,11 @@ class ModeManager {
 
     // Phase 4
     private BundleDownloadManager mBundleDownloadManager;
+
+    // Phase 5
+    private ManagedModeManager   mManagedModeManager;
+    private AutoSwitchLearner    mLearner;
+    private CommunityShareManager mCommunityShare;
 
     private String        mActiveModeId;
     private Deque<String> mModeStack;
@@ -75,6 +81,14 @@ class ModeManager {
         mBundleDownloadManager = bundleMgr;
     }
 
+    void setPhase5Components(ManagedModeManager managed,
+                             AutoSwitchLearner learner,
+                             CommunityShareManager community) {
+        mManagedModeManager = managed;
+        mLearner            = learner;
+        mCommunityShare     = community;
+    }
+
     void init() {
         // Load Tier-1 built-in modes
         for (PersonalityMode mode : Tier1Modes.all()) {
@@ -83,6 +97,11 @@ class ModeManager {
 
         // Load Tier-2 lifestyle modes (Phase 4) — gated by bundle download
         for (PersonalityMode mode : Tier2Modes.allModes()) {
+            mModes.put(mode.id, mode);
+        }
+
+        // Load Tier-3 specialist modes (Phase 5) — gated by bundle download
+        for (PersonalityMode mode : Tier3Modes.allModes()) {
             mModes.put(mode.id, mode);
         }
 
@@ -113,11 +132,27 @@ class ModeManager {
     // ---- Switching ----------------------------------------------------------
 
     SwitchResult activateMode(String modeId) {
+        return activateModeInternal(modeId, false, null);
+    }
+
+    SwitchResult activateManagedMode(String modeId, String pin) {
+        return activateModeInternal(modeId, true, pin);
+    }
+
+    private SwitchResult activateModeInternal(String modeId, boolean pinProvided, String pin) {
         if (!mModes.containsKey(modeId)) return SwitchResult.fail("Unknown mode: " + modeId);
 
-        // Phase 4: Tier-2 modes require bundle download before activation
+        // Phase 5: Check if the current mode is PIN-locked before leaving it
+        if (mManagedModeManager != null && mActiveModeId != null
+                && mManagedModeManager.hasPolicy(mActiveModeId)) {
+            if (!pinProvided || !mManagedModeManager.verifyPin(mActiveModeId, pin)) {
+                return SwitchResult.fail("PIN required to leave managed mode");
+            }
+        }
+
+        // Phase 4/5: Tier-2 and Tier-3 modes require bundle download before activation
         PersonalityMode requested = mModes.get(modeId);
-        if (requested != null && requested.tier == 2
+        if (requested != null && (requested.tier == 2 || requested.tier == 3)
                 && mBundleDownloadManager != null
                 && !mBundleDownloadManager.isBundleDownloaded(modeId)) {
             Log.i(TAG, "Mode " + modeId + " requires bundle download");
@@ -146,6 +181,7 @@ class ModeManager {
         if (mStatePreservation != null)                mStatePreservation.restoreStateForMode(modeId);
         if (mAppVisibility != null)                    mAppVisibility.applyForMode(modeId);
 
+        if (mLearner != null) mLearner.recordManualSwitch(modeId);
         dispatchModeChanged(prevMode, nextMode);
         Log.i(TAG, "Mode: " + previous + " -> " + modeId);
         return SwitchResult.ok(previous, modeId);
@@ -290,6 +326,79 @@ class ModeManager {
     List<String> getModeHiddenApps(String modeId) {
         if (mAppVisibility == null) return new ArrayList<>();
         return mAppVisibility.getHiddenApps(modeId);
+    }
+
+    // ---- Phase 5: Managed mode policy ---------------------------------------
+
+    SwitchResult setManagedModePolicy(za.co.circleos.personality.ManagedModePolicy policy) {
+        if (mManagedModeManager == null) return SwitchResult.fail("Managed modes not available");
+        if (!mModes.containsKey(policy.modeId)) return SwitchResult.fail("Unknown mode: " + policy.modeId);
+        mManagedModeManager.setPolicy(policy);
+        return SwitchResult.ok(policy.modeId, policy.modeId);
+    }
+
+    boolean clearManagedModePolicy(String modeId) {
+        return mManagedModeManager != null && mManagedModeManager.clearPolicy(modeId);
+    }
+
+    za.co.circleos.personality.ManagedModePolicy getManagedModePolicy(String modeId) {
+        return mManagedModeManager != null ? mManagedModeManager.getPolicy(modeId) : null;
+    }
+
+    boolean isManagedModeActive() {
+        return mManagedModeManager != null
+                && mActiveModeId != null
+                && mManagedModeManager.hasPolicy(mActiveModeId);
+    }
+
+    // ---- Phase 5: Auto-switch learning --------------------------------------
+
+    List<za.co.circleos.personality.LearningSuggestion> getLearningSuggestions() {
+        if (mLearner == null) return new ArrayList<>();
+        return mLearner.getSuggestions();
+    }
+
+    void acceptLearningSuggestion(String suggestionId) {
+        if (mLearner == null) return;
+        // Fetch rule before accepting so caller can add trigger
+        mLearner.accept(suggestionId);
+    }
+
+    void dismissLearningSuggestion(String suggestionId) {
+        if (mLearner != null) mLearner.dismiss(suggestionId);
+    }
+
+    SwitchResult undoLastSwitch() {
+        return activatePreviousMode();
+    }
+
+    // ---- Phase 5: Community sharing -----------------------------------------
+
+    String getModeShareUrl(String modeId) {
+        if (mCommunityShare == null) return null;
+        PersonalityMode mode = mModes.get(modeId);
+        if (mode == null) return null;
+        return mCommunityShare.getModeShareUrl(mode);
+    }
+
+    SwitchResult importModeFromUrl(String url) {
+        if (mCommunityShare == null) return SwitchResult.fail("Community sharing not available");
+        za.co.circleos.personality.PersonalityMode mode = mCommunityShare.importFromUrl(url);
+        if (mode == null) return SwitchResult.fail("Failed to import mode from URL");
+        if (mode.id == null || mode.id.isEmpty())
+            mode.id = "community_" + System.currentTimeMillis() % 100000;
+        if (mModes.containsKey(mode.id))
+            mode.id = mode.id + "_" + (System.currentTimeMillis() % 10000);
+        mode.isCustom = true;
+        mModes.put(mode.id, mode);
+        persistCustomModes();
+        Log.i(TAG, "Imported community mode: " + mode.id);
+        return SwitchResult.ok(null, mode.id);
+    }
+
+    List<PersonalityMode> fetchCommunityModes() {
+        if (mCommunityShare == null) return new ArrayList<>();
+        return mCommunityShare.fetchCommunityModes();
     }
 
     // ---- Private helpers ----------------------------------------------------
