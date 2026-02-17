@@ -40,6 +40,7 @@ public class CircleFileDmzService extends SystemService {
     private BehavioralSandbox     mBehavioralSandbox;
     private QuarantineManager     mQuarantineManager;
     private CommunityDefenseService mCommunityDefense;
+    private ResearcherApiService  mResearcherApi;
     private HandlerThread         mWorkerThread;
     private android.os.Handler    mWorkerHandler;
 
@@ -88,6 +89,8 @@ public class CircleFileDmzService extends SystemService {
             mBehavioralSandbox  = new BehavioralSandbox();
             mQuarantineManager  = new QuarantineManager(getContext());
             mCommunityDefense   = new CommunityDefenseService(getContext());
+            mResearcherApi      = new ResearcherApiService(getContext());
+            mQuarantineManager.setResearcherApi(mResearcherApi);
 
             // Kick off initial feed update
             mWorkerHandler.post(() -> {
@@ -236,6 +239,12 @@ public class CircleFileDmzService extends SystemService {
         } finally {
             result.analysisDurationMs = System.currentTimeMillis() - start;
             mSessions.put(sessionId, result);
+            // Feed researcher API with any non-clean result
+            if (mResearcherApi != null
+                    && result.verdict != DmzAnalysisResult.VERDICT_CLEAN
+                    && result.verdict != DmzAnalysisResult.VERDICT_ERROR) {
+                mResearcherApi.processDmzResult(result);
+            }
             try { fileFd.close(); } catch (Exception ignored) {}
         }
     }

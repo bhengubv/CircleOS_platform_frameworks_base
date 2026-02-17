@@ -246,6 +246,7 @@ import com.circleos.server.personality.CirclePersonalityManagerService;
 import com.circleos.server.security.CircleFileDmzService;
 import com.circleos.server.security.QuarantineManager;
 import com.circleos.server.security.CommunityDefenseService;
+import com.circleos.server.security.ResearcherApiService;
 
 import dalvik.system.VMRuntime;
 
@@ -2895,6 +2896,10 @@ public final class SystemServer implements Dumpable {
 
         t.traceBegin("StartCircleCommunityDefenseService");
         mSystemServiceManager.startService(CommunityDefenseService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCircleResearcherApiService");
+        mSystemServiceManager.startService(ResearcherApiService.Lifecycle.class);
         t.traceEnd();
 
         t.traceBegin("AppServiceManager");

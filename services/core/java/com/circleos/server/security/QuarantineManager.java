@@ -45,6 +45,7 @@ public class QuarantineManager extends SystemService {
     private final BinderService mBinderService = new BinderService();
     private final ConcurrentHashMap<String, QuarantineRecord> mRecords
             = new ConcurrentHashMap<>();
+    private ResearcherApiService mResearcherApi;
 
     /* ── Lifecycle ─────────────────────────────────────────────────────── */
 
@@ -70,6 +71,11 @@ public class QuarantineManager extends SystemService {
         new File(QUARANTINE_DIR).mkdirs();
         loadRecords();
         Log.i(TAG, "QuarantineManager started");
+    }
+
+    /** Called by CircleFileDmzService after ResearcherApiService is initialized. */
+    public void setResearcherApi(ResearcherApiService api) {
+        mResearcherApi = api;
     }
 
     /* ── Public API (called from CircleFileDmzService) ─────────────────── */
@@ -111,6 +117,7 @@ public class QuarantineManager extends SystemService {
 
         mRecords.put(id, record);
         persistRecord(record);
+        if (mResearcherApi != null) mResearcherApi.processQuarantineRecord(record);
         return record;
     }
 

@@ -2130,6 +2130,8 @@
         android:protectionLevel="signature" />
     <permission android:name="com.circleos.permission.COMMUNITY_DEFENSE_OPT_IN"
         android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.RESEARCHER_API"
+        android:protectionLevel="signature|privileged" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
