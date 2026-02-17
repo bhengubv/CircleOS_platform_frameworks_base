@@ -2083,6 +2083,36 @@
         android:label="@string/permlab_createNetworkSockets"
         android:protectionLevel="normal|instant" />
 
+    <!-- ============================================================ -->
+    <!-- Circle OS privacy permissions                                 -->
+    <!-- ============================================================ -->
+
+    <!-- Grants internet access. Default: denied for all apps.
+         User must explicitly approve via CircleSettings.
+         <p>Protection level: dangerous -->
+    <permission android:name="com.circleos.permission.NETWORK"
+        android:protectionLevel="dangerous" />
+
+    <!-- Per-sensor permissions — user-grantable dangerous permissions that
+         allow fine-grained sensor access control beyond Android's default. -->
+    <permission android:name="com.circleos.permission.ACCELEROMETER"
+        android:protectionLevel="dangerous" />
+
+    <permission android:name="com.circleos.permission.GYROSCOPE"
+        android:protectionLevel="dangerous" />
+
+    <permission android:name="com.circleos.permission.BAROMETER"
+        android:protectionLevel="dangerous" />
+
+    <permission android:name="com.circleos.permission.MAGNETOMETER"
+        android:protectionLevel="dangerous" />
+
+    <!-- Grants the ability to read and write Circle OS privacy policies.
+         Held only by CircleSettings and system processes.
+         <p>Protection level: signature|privileged -->
+    <permission android:name="com.circleos.permission.MANAGE_PRIVACY"
+        android:protectionLevel="signature|privileged" />
+
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
     -->

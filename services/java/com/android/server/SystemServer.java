@@ -234,6 +234,8 @@ import com.android.server.webkit.WebViewUpdateService;
 import com.android.server.wm.ActivityTaskManagerService;
 import com.android.server.wm.WindowManagerGlobalLock;
 import com.android.server.wm.WindowManagerService;
+import com.circleos.server.privacy.CirclePrivacyManagerService;
+import com.circleos.server.privacy.CirclePermissionService;
 
 import dalvik.system.VMRuntime;
 
@@ -2833,6 +2835,15 @@ public final class SystemServer implements Dumpable {
         // NOTE: ClipboardService depends on ContentCapture and Autofill
         t.traceBegin("StartClipboardService");
         mSystemServiceManager.startService(ClipboardService.class);
+        t.traceEnd();
+
+        // Circle OS Privacy Framework
+        t.traceBegin("StartCirclePrivacyManagerService");
+        mSystemServiceManager.startService(CirclePrivacyManagerService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCirclePermissionService");
+        mSystemServiceManager.startService(CirclePermissionService.Lifecycle.class);
         t.traceEnd();
 
         t.traceBegin("AppServiceManager");
