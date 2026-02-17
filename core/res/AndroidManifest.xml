@@ -2124,6 +2124,12 @@
         android:protectionLevel="normal" />
     <permission android:name="com.circleos.permission.MANAGE_TRAFFIC_LOBBY"
         android:protectionLevel="signature" />
+    <permission android:name="com.circleos.permission.ACCESS_QUARANTINE"
+        android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.MANAGE_QUARANTINE"
+        android:protectionLevel="signature" />
+    <permission android:name="com.circleos.permission.COMMUNITY_DEFENSE_OPT_IN"
+        android:protectionLevel="normal" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal

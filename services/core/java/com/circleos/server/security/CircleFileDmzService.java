@@ -35,10 +35,13 @@ public class CircleFileDmzService extends SystemService {
     public  static final int    VERSION      = 1;
 
     private final BinderService mBinderService = new BinderService();
-    private ThreatFeedDatabase  mFeedDb;
-    private CdrProcessor        mCdrProcessor;
-    private HandlerThread       mWorkerThread;
-    private android.os.Handler  mWorkerHandler;
+    private ThreatFeedDatabase    mFeedDb;
+    private CdrProcessor          mCdrProcessor;
+    private BehavioralSandbox     mBehavioralSandbox;
+    private QuarantineManager     mQuarantineManager;
+    private CommunityDefenseService mCommunityDefense;
+    private HandlerThread         mWorkerThread;
+    private android.os.Handler    mWorkerHandler;
 
     // Active analysis sessions: sessionId → result (null while in progress)
     private final ConcurrentHashMap<String, DmzAnalysisResult> mSessions
@@ -80,8 +83,11 @@ public class CircleFileDmzService extends SystemService {
             mWorkerThread.start();
             mWorkerHandler = new android.os.Handler(mWorkerThread.getLooper());
 
-            mFeedDb       = new ThreatFeedDatabase();
-            mCdrProcessor = new CdrProcessor();
+            mFeedDb             = new ThreatFeedDatabase();
+            mCdrProcessor       = new CdrProcessor();
+            mBehavioralSandbox  = new BehavioralSandbox();
+            mQuarantineManager  = new QuarantineManager(getContext());
+            mCommunityDefense   = new CommunityDefenseService(getContext());
 
             // Kick off initial feed update
             mWorkerHandler.post(() -> {
@@ -188,14 +194,39 @@ public class CircleFileDmzService extends SystemService {
                 return;
             }
 
-            // Stage 2: CDR (images and PDFs in Phase 1)
+            // Stage 2: Behavioral analysis (static pattern analysis)
+            result.stageReached = DmzAnalysisResult.STAGE_SANDBOXED;
+            BehavioralSandbox.SandboxResult sandboxResult =
+                    mBehavioralSandbox.analyze(fileFd, mimeType, result);
+
+            // Escalate to THREAT if sandbox found embedded executables or macros
+            if (sandboxResult.suspiciousActivity) {
+                // Re-check against threat feeds with extracted IOCs
+                for (String url : sandboxResult.extractedUrls) {
+                    String host = url.replaceFirst("https?://", "").split("/")[0];
+                    if (mFeedDb != null && mFeedDb.isDomainBlocked(host)) {
+                        result.verdict = DmzAnalysisResult.VERDICT_THREAT;
+                        result.findings.add("Extracted URL matches C2 feed: " + host);
+                        mQuarantineManager.quarantine(result, null);
+                        mCommunityDefense.submitFromDmzResult(result);
+                        mSessions.put(sessionId, result);
+                        return;
+                    }
+                }
+            }
+
+            // Stage 3: CDR (Phase 2 — Office, HTML, ZIP, Video/Audio added)
             result.stageReached = DmzAnalysisResult.STAGE_CDR;
             boolean sanitized = mCdrProcessor.process(sessionId, fileFd, mimeType, result);
             if (sanitized) {
                 result.hasSanitizedVersion = true;
-                result.verdict = DmzAnalysisResult.VERDICT_SANITIZED;
+                result.verdict = sandboxResult.suspiciousActivity
+                        ? DmzAnalysisResult.VERDICT_SUSPICIOUS
+                        : DmzAnalysisResult.VERDICT_SANITIZED;
             } else {
-                result.verdict = DmzAnalysisResult.VERDICT_CLEAN;
+                result.verdict = sandboxResult.suspiciousActivity
+                        ? DmzAnalysisResult.VERDICT_SUSPICIOUS
+                        : DmzAnalysisResult.VERDICT_CLEAN;
             }
 
         } catch (Exception e) {
