@@ -23,34 +23,33 @@ import za.co.circleos.personality.PersonalityMode;
 import za.co.circleos.personality.SwitchResult;
 
 /**
- * Core mode management logic: atomic switching, mode stack, emergency bypass,
- * callback dispatch, and Phase 2 integration (conflict resolution, state
- * preservation, notification broker).
- *
- * Runs on the CirclePersonality HandlerThread.
+ * Core mode management: switching, stack, emergency bypass, callbacks,
+ * Phase 2 (notification broker, state preservation),
+ * Phase 3 (custom modes, import/export, app visibility).
  */
 class ModeManager {
 
-    private static final String TAG = "CirclePersonality";
-
-    /** Maximum depth of the mode history stack. */
-    private static final int MAX_STACK_DEPTH = 10;
+    private static final String TAG           = "CirclePersonality";
+    private static final int    MAX_STACK_DEPTH = 10;
 
     private final Context                      mContext;
     private final ModeStateStore               mStateStore;
     private final NotificationRulesEngine      mNotifEngine;
     private final Map<String, PersonalityMode> mModes = new ArrayMap<>();
 
-    // Phase 2 components — set via setPhase2Components() after construction
+    // Phase 2
     private NotificationBroker       mNotifBroker;
     private StatePreservationManager mStatePreservation;
+
+    // Phase 3
+    private CustomModeStore     mCustomStore;
+    private AppVisibilityManager mAppVisibility;
 
     private String        mActiveModeId;
     private Deque<String> mModeStack;
     private boolean       mEmergencyBypassActive = false;
 
-    final RemoteCallbackList<IPersonalityCallback> mCallbacks =
-            new RemoteCallbackList<>();
+    final RemoteCallbackList<IPersonalityCallback> mCallbacks = new RemoteCallbackList<>();
 
     ModeManager(Context context) {
         mContext     = context;
@@ -58,138 +57,109 @@ class ModeManager {
         mNotifEngine = new NotificationRulesEngine(context);
     }
 
-    /** Injects Phase 2 components after service start. */
-    void setPhase2Components(NotificationBroker broker,
-                             StatePreservationManager statePreservation) {
+    void setPhase2Components(NotificationBroker broker, StatePreservationManager sp) {
         mNotifBroker       = broker;
-        mStatePreservation = statePreservation;
+        mStatePreservation = sp;
     }
 
-    /** Called once on boot to restore persisted state. */
+    void setPhase3Components(CustomModeStore store, AppVisibilityManager appVis) {
+        mCustomStore   = store;
+        mAppVisibility = appVis;
+    }
+
     void init() {
+        // Load Tier-1 built-in modes
         for (PersonalityMode mode : Tier1Modes.all()) {
             mModes.put(mode.id, mode);
         }
 
-        mModeStack    = mStateStore.loadModeStack();
-        mActiveModeId = mStateStore.loadActiveMode();
-
-        if (!mModes.containsKey(mActiveModeId)) {
-            mActiveModeId = ModeStateStore.DEFAULT_MODE;
+        // Load persisted custom modes (Phase 3)
+        if (mCustomStore != null) {
+            for (PersonalityMode m : mCustomStore.loadCustomModes()) {
+                mModes.put(m.id, m);
+            }
+            mAppVisibility.init();
         }
 
-        Log.i(TAG, "Restored mode: " + mActiveModeId);
+        mModeStack    = mStateStore.loadModeStack();
+        mActiveModeId = mStateStore.loadActiveMode();
+        if (!mModes.containsKey(mActiveModeId)) mActiveModeId = ModeStateStore.DEFAULT_MODE;
+
+        Log.i(TAG, "Restored mode: " + mActiveModeId + " (" + mModes.size() + " modes)");
         applyCurrentModeConfig();
     }
 
-    PersonalityMode getActiveMode() {
-        return mModes.get(mActiveModeId);
-    }
+    // ---- Queries ------------------------------------------------------------
 
-    List<PersonalityMode> getAvailableModes() {
-        return new ArrayList<>(mModes.values());
-    }
+    PersonalityMode getActiveMode()              { return mModes.get(mActiveModeId); }
+    List<PersonalityMode> getAvailableModes()    { return new ArrayList<>(mModes.values()); }
+    String getActiveModeId()                     { return mActiveModeId; }
+    boolean isModeActive(String id)              { return mActiveModeId != null && mActiveModeId.equals(id); }
+    boolean isEmergencyBypassActive()            { return mEmergencyBypassActive; }
 
-    String getActiveModeId() {
-        return mActiveModeId;
-    }
-
-    boolean isModeActive(String modeId) {
-        return mActiveModeId != null && mActiveModeId.equals(modeId);
-    }
+    // ---- Switching ----------------------------------------------------------
 
     SwitchResult activateMode(String modeId) {
-        if (!mModes.containsKey(modeId)) {
-            return SwitchResult.fail("Unknown mode: " + modeId);
-        }
+        if (!mModes.containsKey(modeId)) return SwitchResult.fail("Unknown mode: " + modeId);
 
         String previous = mActiveModeId;
         PersonalityMode prevMode = mModes.get(previous);
         PersonalityMode nextMode = mModes.get(modeId);
 
-        // Phase 2: capture state before leaving current mode
-        if (mStatePreservation != null && previous != null) {
+        if (mStatePreservation != null && previous != null)
             mStatePreservation.captureStateForMode(previous);
-        }
-
-        // Phase 2: notify broker that current mode is being deactivated
-        if (mNotifBroker != null && prevMode != null) {
+        if (mNotifBroker != null && prevMode != null)
             mNotifBroker.onModeDeactivated(prevMode);
-        }
 
-        // Push current onto stack (cap depth)
         if (previous != null) {
             mModeStack.addLast(previous);
-            while (mModeStack.size() > MAX_STACK_DEPTH) {
-                mModeStack.removeFirst();
-            }
+            while (mModeStack.size() > MAX_STACK_DEPTH) mModeStack.removeFirst();
         }
-
         mActiveModeId = modeId;
         mStateStore.saveActiveMode(modeId);
         mStateStore.saveModeStack(mModeStack);
-
         applyCurrentModeConfig();
 
-        // Phase 2: notify broker that new mode is active
-        if (mNotifBroker != null && nextMode != null) {
-            mNotifBroker.onModeActivated(nextMode);
-        }
-
-        // Phase 2: restore state for the mode we're entering
-        if (mStatePreservation != null) {
-            mStatePreservation.restoreStateForMode(modeId);
-        }
+        if (mNotifBroker != null && nextMode != null)  mNotifBroker.onModeActivated(nextMode);
+        if (mStatePreservation != null)                mStatePreservation.restoreStateForMode(modeId);
+        if (mAppVisibility != null)                    mAppVisibility.applyForMode(modeId);
 
         dispatchModeChanged(prevMode, nextMode);
-
-        Log.i(TAG, "Mode switched: " + previous + " -> " + modeId);
+        Log.i(TAG, "Mode: " + previous + " -> " + modeId);
         return SwitchResult.ok(previous, modeId);
     }
 
     SwitchResult activatePreviousMode() {
-        if (mModeStack.isEmpty()) {
-            return SwitchResult.fail("No previous mode");
-        }
+        if (mModeStack.isEmpty()) return SwitchResult.fail("No previous mode");
 
         String previous = mActiveModeId;
         String target   = mModeStack.removeLast();
-
         PersonalityMode prevMode = mModes.get(previous);
         PersonalityMode nextMode = mModes.get(target);
 
-        // Phase 2: capture + broker deactivation
-        if (mStatePreservation != null && previous != null) {
+        if (mStatePreservation != null && previous != null)
             mStatePreservation.captureStateForMode(previous);
-        }
-        if (mNotifBroker != null && prevMode != null) {
-            mNotifBroker.onModeDeactivated(prevMode);
-        }
+        if (mNotifBroker != null && prevMode != null) mNotifBroker.onModeDeactivated(prevMode);
 
         mActiveModeId = target;
         mStateStore.saveActiveMode(target);
         mStateStore.saveModeStack(mModeStack);
-
         applyCurrentModeConfig();
 
-        // Phase 2: broker activation + state restore
-        if (mNotifBroker != null && nextMode != null) {
-            mNotifBroker.onModeActivated(nextMode);
-        }
-        if (mStatePreservation != null) {
-            mStatePreservation.restoreStateForMode(target);
-        }
+        if (mNotifBroker != null && nextMode != null)  mNotifBroker.onModeActivated(nextMode);
+        if (mStatePreservation != null)                mStatePreservation.restoreStateForMode(target);
+        if (mAppVisibility != null)                    mAppVisibility.applyForMode(target);
 
         dispatchModeChanged(prevMode, nextMode);
-
-        Log.i(TAG, "Restored previous mode: " + previous + " -> " + target);
+        Log.i(TAG, "Previous mode: " + previous + " -> " + target);
         return SwitchResult.ok(previous, target);
     }
+
+    // ---- Emergency bypass ---------------------------------------------------
 
     void triggerEmergencyBypass() {
         if (!mEmergencyBypassActive) {
             mEmergencyBypassActive = true;
-            // Restore full notifications so starred contacts can reach user
             mNotifEngine.reset();
             dispatchEmergencyBypassChanged(true);
             Log.i(TAG, "Emergency bypass activated");
@@ -205,29 +175,118 @@ class ModeManager {
         }
     }
 
-    boolean isEmergencyBypassActive() {
-        return mEmergencyBypassActive;
+    // ---- Phase 3: Custom mode CRUD ------------------------------------------
+
+    SwitchResult createCustomMode(PersonalityMode mode) {
+        if (mode == null || mode.id == null || mode.id.isEmpty())
+            return SwitchResult.fail("Invalid mode");
+        if (mModes.containsKey(mode.id))
+            return SwitchResult.fail("Mode id already exists: " + mode.id);
+        mode.isCustom = true;
+        mModes.put(mode.id, mode);
+        persistCustomModes();
+        Log.i(TAG, "Created custom mode: " + mode.id);
+        return SwitchResult.ok(null, mode.id);
     }
 
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
+    SwitchResult updateMode(PersonalityMode mode) {
+        if (mode == null || mode.id == null) return SwitchResult.fail("Invalid mode");
+        PersonalityMode existing = mModes.get(mode.id);
+        if (existing == null) return SwitchResult.fail("Mode not found: " + mode.id);
+        if (!existing.isCustom)  return SwitchResult.fail("Cannot edit built-in mode");
+        mModes.put(mode.id, mode);
+        persistCustomModes();
+        Log.i(TAG, "Updated mode: " + mode.id);
+        return SwitchResult.ok(mode.id, mode.id);
+    }
+
+    SwitchResult deleteMode(String modeId) {
+        PersonalityMode m = mModes.get(modeId);
+        if (m == null)         return SwitchResult.fail("Mode not found: " + modeId);
+        if (!m.isCustom)       return SwitchResult.fail("Cannot delete built-in mode");
+        if (modeId.equals(mActiveModeId)) activateMode(ModeStateStore.DEFAULT_MODE);
+        mModes.remove(modeId);
+        persistCustomModes();
+        Log.i(TAG, "Deleted mode: " + modeId);
+        return SwitchResult.ok(modeId, null);
+    }
+
+    SwitchResult cloneMode(String sourceId, String newId, String newName) {
+        PersonalityMode src = mModes.get(sourceId);
+        if (src == null) return SwitchResult.fail("Source mode not found: " + sourceId);
+        if (newId == null || newId.isEmpty()) return SwitchResult.fail("Invalid new id");
+        if (mModes.containsKey(newId)) return SwitchResult.fail("Mode id already exists: " + newId);
+
+        PersonalityMode clone = new PersonalityMode();
+        clone.id          = newId;
+        clone.name        = newName != null ? newName : src.name + " (copy)";
+        clone.description = src.description;
+        clone.tier        = src.tier;
+        clone.isCustom    = true;
+        clone.config      = src.config; // shared reference; ModeConfig is Parcelable so safe for reads
+        mModes.put(clone.id, clone);
+        persistCustomModes();
+        Log.i(TAG, "Cloned " + sourceId + " -> " + newId);
+        return SwitchResult.ok(sourceId, newId);
+    }
+
+    // ---- Phase 3: Import / export -------------------------------------------
+
+    String exportModesJson() {
+        return ModeSerializer.encodeExport(new ArrayList<>(mModes.values()));
+    }
+
+    SwitchResult importModesJson(String json) {
+        try {
+            List<PersonalityMode> imported = ModeSerializer.decodeModeList(json);
+            if (imported == null || imported.isEmpty())
+                return SwitchResult.fail("No valid modes in JSON");
+            int count = 0;
+            for (PersonalityMode m : imported) {
+                if (m.id == null || m.id.isEmpty()) continue;
+                // Skip built-in ids
+                if (Tier1Modes.all().stream().anyMatch(t -> t.id.equals(m.id))) continue;
+                m.isCustom = true;
+                mModes.put(m.id, m);
+                count++;
+            }
+            persistCustomModes();
+            Log.i(TAG, "Imported " + count + " modes");
+            return SwitchResult.ok(null, "imported:" + count);
+        } catch (Exception e) {
+            Log.e(TAG, "importModesJson failed: " + e.getMessage());
+            return SwitchResult.fail("Parse error: " + e.getMessage());
+        }
+    }
+
+    // ---- Phase 3: App visibility --------------------------------------------
+
+    void setModeHiddenApps(String modeId, List<String> packages) {
+        if (mAppVisibility != null) mAppVisibility.setHiddenApps(modeId, packages);
+    }
+
+    List<String> getModeHiddenApps(String modeId) {
+        if (mAppVisibility == null) return new ArrayList<>();
+        return mAppVisibility.getHiddenApps(modeId);
+    }
+
+    // ---- Private helpers ----------------------------------------------------
 
     private void applyCurrentModeConfig() {
         PersonalityMode mode = mModes.get(mActiveModeId);
         if (mode == null || mode.config == null) return;
+        if (!mEmergencyBypassActive) mNotifEngine.applyModeRules(mode.config);
+    }
 
-        if (!mEmergencyBypassActive) {
-            mNotifEngine.applyModeRules(mode.config);
-        }
+    private void persistCustomModes() {
+        if (mCustomStore != null) mCustomStore.saveCustomModes(new ArrayList<>(mModes.values()));
     }
 
     private void dispatchModeChanged(PersonalityMode prev, PersonalityMode next) {
         int n = mCallbacks.beginBroadcast();
         for (int i = 0; i < n; i++) {
-            try {
-                mCallbacks.getBroadcastItem(i).onModeChanged(prev, next);
-            } catch (RemoteException ignored) {}
+            try { mCallbacks.getBroadcastItem(i).onModeChanged(prev, next); }
+            catch (RemoteException ignored) {}
         }
         mCallbacks.finishBroadcast();
     }
@@ -235,9 +294,8 @@ class ModeManager {
     private void dispatchEmergencyBypassChanged(boolean active) {
         int n = mCallbacks.beginBroadcast();
         for (int i = 0; i < n; i++) {
-            try {
-                mCallbacks.getBroadcastItem(i).onEmergencyBypassChanged(active);
-            } catch (RemoteException ignored) {}
+            try { mCallbacks.getBroadcastItem(i).onEmergencyBypassChanged(active); }
+            catch (RemoteException ignored) {}
         }
         mCallbacks.finishBroadcast();
     }

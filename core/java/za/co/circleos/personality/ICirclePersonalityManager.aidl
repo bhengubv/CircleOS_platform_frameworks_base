@@ -8,6 +8,7 @@ package za.co.circleos.personality;
 import za.co.circleos.personality.PersonalityMode;
 import za.co.circleos.personality.SwitchResult;
 import za.co.circleos.personality.TriggerRule;
+import za.co.circleos.personality.AppRule;
 import za.co.circleos.personality.IPersonalityCallback;
 
 interface ICirclePersonalityManager {
@@ -40,4 +41,18 @@ interface ICirclePersonalityManager {
 
     // Phase 2: Notification broker
     void dismissBrokerNotifications();
+
+    // Phase 3: Custom mode management
+    SwitchResult createCustomMode(in PersonalityMode mode);
+    SwitchResult updateMode(in PersonalityMode mode);
+    SwitchResult deleteMode(String modeId);
+    SwitchResult cloneMode(String sourceModeId, String newModeId, String newName);
+
+    // Phase 3: Import / export
+    String exportModesJson();
+    SwitchResult importModesJson(String json);
+
+    // Phase 3: Per-mode app visibility
+    void setModeHiddenApps(String modeId, in List<String> packageNames);
+    List<String> getModeHiddenApps(String modeId);
 }

@@ -17,6 +17,7 @@ public final class PersonalityMode implements Parcelable {
     public String     name;        // Display name, e.g. "Daily"
     public String     description; // One-line summary shown in UI
     public int        tier;        // 1=bundled, 2=download-on-activation, 3=specialist
+    public boolean    isCustom;    // true if user-created custom mode
     public ModeConfig config;      // Settings applied when this mode is active
 
     public PersonalityMode() {}
@@ -26,6 +27,7 @@ public final class PersonalityMode implements Parcelable {
         name        = in.readString();
         description = in.readString();
         tier        = in.readInt();
+        isCustom    = in.readByte() != 0;
         config      = in.readParcelable(ModeConfig.class.getClassLoader());
     }
 
@@ -35,6 +37,7 @@ public final class PersonalityMode implements Parcelable {
         dest.writeString(name);
         dest.writeString(description);
         dest.writeInt(tier);
+        dest.writeByte((byte)(isCustom ? 1 : 0));
         dest.writeParcelable(config, flags);
     }
 

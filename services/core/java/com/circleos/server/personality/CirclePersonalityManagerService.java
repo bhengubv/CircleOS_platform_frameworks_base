@@ -21,60 +21,46 @@ import za.co.circleos.personality.SwitchResult;
 import za.co.circleos.personality.TriggerRule;
 
 /**
- * System service that manages CircleOS personality modes (profiles).
+ * System service that manages CircleOS personality modes.
  *
- * <p>Registered as {@code "circle.personality"} in SystemServer. Apps acquire
- * the Binder via {@code ServiceManager.getService("circle.personality")}.</p>
- *
- * <p>Phase 1: mode switching, Tier-1 mode definitions, notification rules,
- * emergency bypass, QS tile hook.</p>
- * <p>Phase 2: auto-switch triggers, conflict resolver, notification broker,
- * state preservation.</p>
+ * Phase 1: mode switching, Tier-1 modes, notification rules, emergency bypass.
+ * Phase 2: auto-switch triggers, conflict resolver, notification broker, state preservation.
+ * Phase 3: custom mode CRUD, import/export, per-mode app visibility.
  */
 public class CirclePersonalityManagerService extends SystemService {
 
     private static final String TAG          = "CirclePersonality";
     private static final String SERVICE_NAME = "circle.personality";
-    static final int SERVICE_VERSION = 2;
+    static final int SERVICE_VERSION = 3;
 
     private HandlerThread            mHandlerThread;
     private Handler                  mHandler;
     private ModeManager              mModeManager;
+    // Phase 2
     private ConflictResolver         mConflictResolver;
     private AutoSwitchManager        mAutoSwitchManager;
     private NotificationBroker       mNotifBroker;
     private StatePreservationManager mStatePreservation;
+    // Phase 3
+    private CustomModeStore          mCustomStore;
+    private AppVisibilityManager     mAppVisibility;
 
-    // -------------------------------------------------------------------------
-    // Lifecycle wrapper — mirrors all existing Circle services
-    // -------------------------------------------------------------------------
+    // ---- Lifecycle wrapper --------------------------------------------------
 
     public static class Lifecycle extends SystemService {
         private CirclePersonalityManagerService mService;
+        public Lifecycle(Context context) { super(context); }
 
-        public Lifecycle(Context context) {
-            super(context);
-        }
-
-        @Override
-        public void onStart() {
+        @Override public void onStart() {
             mService = new CirclePersonalityManagerService(getContext());
             mService.onStart();
         }
-
-        @Override
-        public void onBootPhase(int phase) {
-            mService.onBootPhase(phase);
-        }
+        @Override public void onBootPhase(int phase) { mService.onBootPhase(phase); }
     }
 
-    public CirclePersonalityManagerService(Context context) {
-        super(context);
-    }
+    public CirclePersonalityManagerService(Context context) { super(context); }
 
-    // -------------------------------------------------------------------------
-    // SystemService lifecycle
-    // -------------------------------------------------------------------------
+    // ---- SystemService lifecycle --------------------------------------------
 
     @Override
     public void onStart() {
@@ -82,15 +68,21 @@ public class CirclePersonalityManagerService extends SystemService {
         mHandlerThread.start();
         mHandler = new Handler(mHandlerThread.getLooper());
 
-        // Phase 2 components
+        // Phase 2
         mConflictResolver  = new ConflictResolver();
         mNotifBroker       = new NotificationBroker(getContext());
         mStatePreservation = new StatePreservationManager(getContext());
         mAutoSwitchManager = new AutoSwitchManager();
 
-        // Core manager
+        // Phase 3
+        mCustomStore   = new CustomModeStore();
+        mCustomStore.init();
+        mAppVisibility = new AppVisibilityManager(getContext(), mCustomStore);
+
+        // Core manager — inject all components
         mModeManager = new ModeManager(getContext());
         mModeManager.setPhase2Components(mNotifBroker, mStatePreservation);
+        mModeManager.setPhase3Components(mCustomStore, mAppVisibility);
 
         publishBinderService(SERVICE_NAME, mBinder);
         Log.i(TAG, "CirclePersonalityManagerService started (v" + SERVICE_VERSION + ")");
@@ -101,123 +93,107 @@ public class CirclePersonalityManagerService extends SystemService {
         if (phase == PHASE_BOOT_COMPLETED) {
             mHandler.post(() -> {
                 mModeManager.init();
-                mAutoSwitchManager.init(getContext(), mModeManager,
-                        mConflictResolver, mHandler);
-                Log.i(TAG, "Boot complete — mode: " + mModeManager.getActiveModeId()
-                        + ", auto-switch enabled: " + mAutoSwitchManager.isEnabled());
+                mAutoSwitchManager.init(getContext(), mModeManager, mConflictResolver, mHandler);
+                Log.i(TAG, "Boot complete — mode: " + mModeManager.getActiveModeId());
             });
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Binder implementation
-    // -------------------------------------------------------------------------
+    // ---- Binder implementation ----------------------------------------------
 
     private final ICirclePersonalityManager.Stub mBinder =
             new ICirclePersonalityManager.Stub() {
 
-        // ---- Phase 1 --------------------------------------------------------
+        // Phase 1 ----
 
-        @Override
-        public PersonalityMode getActiveMode() {
-            return mModeManager.getActiveMode();
-        }
-
-        @Override
-        public List<PersonalityMode> getAvailableModes() {
-            return mModeManager.getAvailableModes();
-        }
-
-        @Override
-        public String getActiveModeId() {
-            return mModeManager.getActiveModeId();
-        }
-
-        @Override
-        public boolean isModeActive(String modeId) {
-            return mModeManager.isModeActive(modeId);
-        }
-
-        @Override
-        public int getServiceVersion() {
-            return SERVICE_VERSION;
-        }
+        @Override public PersonalityMode getActiveMode()       { return mModeManager.getActiveMode(); }
+        @Override public List<PersonalityMode> getAvailableModes() { return mModeManager.getAvailableModes(); }
+        @Override public String getActiveModeId()              { return mModeManager.getActiveModeId(); }
+        @Override public boolean isModeActive(String id)       { return mModeManager.isModeActive(id); }
+        @Override public int getServiceVersion()               { return SERVICE_VERSION; }
 
         @Override
         public SwitchResult activateMode(String modeId) {
-            final SwitchResult[] result = new SwitchResult[1];
-            mHandler.post(() -> result[0] = mModeManager.activateMode(modeId));
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.activateMode(modeId));
             try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-            return result[0] != null ? result[0] : SwitchResult.fail("Timeout");
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
         }
 
         @Override
         public SwitchResult activatePreviousMode() {
-            final SwitchResult[] result = new SwitchResult[1];
-            mHandler.post(() -> result[0] = mModeManager.activatePreviousMode());
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.activatePreviousMode());
             try { Thread.sleep(50); } catch (InterruptedException ignored) {}
-            return result[0] != null ? result[0] : SwitchResult.fail("Timeout");
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
+        }
+
+        @Override public void registerCallback(IPersonalityCallback cb)   { mModeManager.mCallbacks.register(cb); }
+        @Override public void unregisterCallback(IPersonalityCallback cb) { mModeManager.mCallbacks.unregister(cb); }
+        @Override public void triggerEmergencyBypass()  { mHandler.post(mModeManager::triggerEmergencyBypass); }
+        @Override public void clearEmergencyBypass()    { mHandler.post(mModeManager::clearEmergencyBypass); }
+        @Override public boolean isEmergencyBypassActive() { return mModeManager.isEmergencyBypassActive(); }
+
+        // Phase 2 ----
+
+        @Override public void addTriggerRule(TriggerRule rule)    { if (rule != null) mHandler.post(() -> mAutoSwitchManager.addRule(rule)); }
+        @Override public void removeTriggerRule(String ruleId)    { if (ruleId != null) mHandler.post(() -> mAutoSwitchManager.removeRule(ruleId)); }
+        @Override public List<TriggerRule> getTriggerRules()      { return mAutoSwitchManager.getRules(); }
+        @Override public void setAutoSwitchEnabled(boolean en)    { mHandler.post(() -> mAutoSwitchManager.setEnabled(en)); }
+        @Override public boolean isAutoSwitchEnabled()            { return mAutoSwitchManager.isEnabled(); }
+        @Override public void dismissBrokerNotifications()        { mNotifBroker.dismissBrokerNotifications(); }
+
+        // Phase 3 ----
+
+        @Override
+        public SwitchResult createCustomMode(PersonalityMode mode) {
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.createCustomMode(mode));
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
         }
 
         @Override
-        public void registerCallback(IPersonalityCallback callback) {
-            mModeManager.mCallbacks.register(callback);
+        public SwitchResult updateMode(PersonalityMode mode) {
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.updateMode(mode));
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
         }
 
         @Override
-        public void unregisterCallback(IPersonalityCallback callback) {
-            mModeManager.mCallbacks.unregister(callback);
+        public SwitchResult deleteMode(String modeId) {
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.deleteMode(modeId));
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
         }
 
         @Override
-        public void triggerEmergencyBypass() {
-            mHandler.post(mModeManager::triggerEmergencyBypass);
+        public SwitchResult cloneMode(String sourceId, String newId, String newName) {
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.cloneMode(sourceId, newId, newName));
+            try { Thread.sleep(50); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
+        }
+
+        @Override public String exportModesJson()                   { return mModeManager.exportModesJson(); }
+
+        @Override
+        public SwitchResult importModesJson(String json) {
+            final SwitchResult[] r = new SwitchResult[1];
+            mHandler.post(() -> r[0] = mModeManager.importModesJson(json));
+            try { Thread.sleep(200); } catch (InterruptedException ignored) {}
+            return r[0] != null ? r[0] : SwitchResult.fail("Timeout");
         }
 
         @Override
-        public void clearEmergencyBypass() {
-            mHandler.post(mModeManager::clearEmergencyBypass);
+        public void setModeHiddenApps(String modeId, List<String> packages) {
+            mHandler.post(() -> mModeManager.setModeHiddenApps(modeId, packages));
         }
 
-        @Override
-        public boolean isEmergencyBypassActive() {
-            return mModeManager.isEmergencyBypassActive();
-        }
-
-        // ---- Phase 2: auto-switch -------------------------------------------
-
-        @Override
-        public void addTriggerRule(TriggerRule rule) {
-            if (rule == null) return;
-            mHandler.post(() -> mAutoSwitchManager.addRule(rule));
-        }
-
-        @Override
-        public void removeTriggerRule(String ruleId) {
-            if (ruleId == null) return;
-            mHandler.post(() -> mAutoSwitchManager.removeRule(ruleId));
-        }
-
-        @Override
-        public List<TriggerRule> getTriggerRules() {
-            return mAutoSwitchManager.getRules();
-        }
-
-        @Override
-        public void setAutoSwitchEnabled(boolean enabled) {
-            mHandler.post(() -> mAutoSwitchManager.setEnabled(enabled));
-        }
-
-        @Override
-        public boolean isAutoSwitchEnabled() {
-            return mAutoSwitchManager.isEnabled();
-        }
-
-        // ---- Phase 2: notification broker -----------------------------------
-
-        @Override
-        public void dismissBrokerNotifications() {
-            mNotifBroker.dismissBrokerNotifications();
+        @Override public List<String> getModeHiddenApps(String modeId) {
+            return mModeManager.getModeHiddenApps(modeId);
         }
     };
 }
