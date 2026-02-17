@@ -10,6 +10,8 @@ import za.co.circleos.personality.SwitchResult;
 import za.co.circleos.personality.TriggerRule;
 import za.co.circleos.personality.AppRule;
 import za.co.circleos.personality.IPersonalityCallback;
+import za.co.circleos.personality.ModeBundle;
+import za.co.circleos.personality.IBundleCallback;
 
 interface ICirclePersonalityManager {
     // Query
@@ -55,4 +57,12 @@ interface ICirclePersonalityManager {
     // Phase 3: Per-mode app visibility
     void setModeHiddenApps(String modeId, in List<String> packageNames);
     List<String> getModeHiddenApps(String modeId);
+
+    // Phase 4: Lifestyle mode bundle management
+    ModeBundle getBundleInfo(String modeId);
+    List<ModeBundle> getAvailableBundles();
+    void downloadBundle(String modeId, IBundleCallback callback);
+    void cancelBundleDownload(String modeId);
+    boolean isBundleDownloaded(String modeId);
+    List<String> getBundleApps(String modeId);
 }

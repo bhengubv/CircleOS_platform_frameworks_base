@@ -18,6 +18,8 @@ public final class SwitchResult implements Parcelable {
     public String  previousModeId; // null if no previous mode
     public String  newModeId;
     public String  errorMessage;   // null on success
+    public boolean requiresBundle;
+    public String  pendingBundleId;
 
     public SwitchResult() {}
 
@@ -36,11 +38,22 @@ public final class SwitchResult implements Parcelable {
         return r;
     }
 
+    public static SwitchResult requiresBundle(String modeId) {
+        SwitchResult r = new SwitchResult();
+        r.success = false;
+        r.requiresBundle = true;
+        r.pendingBundleId = modeId;
+        r.errorMessage = "BUNDLE_REQUIRED";
+        return r;
+    }
+
     protected SwitchResult(Parcel in) {
         success        = in.readByte() != 0;
         previousModeId = in.readString();
         newModeId      = in.readString();
         errorMessage   = in.readString();
+        requiresBundle  = in.readByte() != 0;
+        pendingBundleId = in.readString();
     }
 
     @Override
@@ -49,6 +62,8 @@ public final class SwitchResult implements Parcelable {
         dest.writeString(previousModeId);
         dest.writeString(newModeId);
         dest.writeString(errorMessage);
+        dest.writeByte((byte)(requiresBundle ? 1 : 0));
+        dest.writeString(pendingBundleId);
     }
 
     @Override

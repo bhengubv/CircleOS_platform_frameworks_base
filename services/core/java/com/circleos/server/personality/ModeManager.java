@@ -25,7 +25,8 @@ import za.co.circleos.personality.SwitchResult;
 /**
  * Core mode management: switching, stack, emergency bypass, callbacks,
  * Phase 2 (notification broker, state preservation),
- * Phase 3 (custom modes, import/export, app visibility).
+ * Phase 3 (custom modes, import/export, app visibility),
+ * Phase 4 (Tier-2 bundle gating).
  */
 class ModeManager {
 
@@ -44,6 +45,9 @@ class ModeManager {
     // Phase 3
     private CustomModeStore     mCustomStore;
     private AppVisibilityManager mAppVisibility;
+
+    // Phase 4
+    private BundleDownloadManager mBundleDownloadManager;
 
     private String        mActiveModeId;
     private Deque<String> mModeStack;
@@ -67,9 +71,18 @@ class ModeManager {
         mAppVisibility = appVis;
     }
 
+    void setPhase4Components(BundleDownloadManager bundleMgr) {
+        mBundleDownloadManager = bundleMgr;
+    }
+
     void init() {
         // Load Tier-1 built-in modes
         for (PersonalityMode mode : Tier1Modes.all()) {
+            mModes.put(mode.id, mode);
+        }
+
+        // Load Tier-2 lifestyle modes (Phase 4) — gated by bundle download
+        for (PersonalityMode mode : Tier2Modes.allModes()) {
             mModes.put(mode.id, mode);
         }
 
@@ -101,6 +114,15 @@ class ModeManager {
 
     SwitchResult activateMode(String modeId) {
         if (!mModes.containsKey(modeId)) return SwitchResult.fail("Unknown mode: " + modeId);
+
+        // Phase 4: Tier-2 modes require bundle download before activation
+        PersonalityMode requested = mModes.get(modeId);
+        if (requested != null && requested.tier == 2
+                && mBundleDownloadManager != null
+                && !mBundleDownloadManager.isBundleDownloaded(modeId)) {
+            Log.i(TAG, "Mode " + modeId + " requires bundle download");
+            return SwitchResult.requiresBundle(modeId);
+        }
 
         String previous = mActiveModeId;
         PersonalityMode prevMode = mModes.get(previous);

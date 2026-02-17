@@ -14,8 +14,10 @@ import com.android.server.SystemService;
 
 import java.util.List;
 
+import za.co.circleos.personality.IBundleCallback;
 import za.co.circleos.personality.ICirclePersonalityManager;
 import za.co.circleos.personality.IPersonalityCallback;
+import za.co.circleos.personality.ModeBundle;
 import za.co.circleos.personality.PersonalityMode;
 import za.co.circleos.personality.SwitchResult;
 import za.co.circleos.personality.TriggerRule;
@@ -26,12 +28,13 @@ import za.co.circleos.personality.TriggerRule;
  * Phase 1: mode switching, Tier-1 modes, notification rules, emergency bypass.
  * Phase 2: auto-switch triggers, conflict resolver, notification broker, state preservation.
  * Phase 3: custom mode CRUD, import/export, per-mode app visibility.
+ * Phase 4: Tier-2 lifestyle modes, download-on-activation bundle flow.
  */
 public class CirclePersonalityManagerService extends SystemService {
 
     private static final String TAG          = "CirclePersonality";
     private static final String SERVICE_NAME = "circle.personality";
-    static final int SERVICE_VERSION = 3;
+    static final int SERVICE_VERSION = 4;
 
     private HandlerThread            mHandlerThread;
     private Handler                  mHandler;
@@ -44,6 +47,9 @@ public class CirclePersonalityManagerService extends SystemService {
     // Phase 3
     private CustomModeStore          mCustomStore;
     private AppVisibilityManager     mAppVisibility;
+    // Phase 4
+    private BundleStateStore         mBundleStateStore;
+    private BundleDownloadManager    mBundleDownloadManager;
 
     // ---- Lifecycle wrapper --------------------------------------------------
 
@@ -79,10 +85,15 @@ public class CirclePersonalityManagerService extends SystemService {
         mCustomStore.init();
         mAppVisibility = new AppVisibilityManager(getContext(), mCustomStore);
 
+        // Phase 4
+        mBundleStateStore      = new BundleStateStore();
+        mBundleDownloadManager = new BundleDownloadManager(mBundleStateStore);
+
         // Core manager — inject all components
         mModeManager = new ModeManager(getContext());
         mModeManager.setPhase2Components(mNotifBroker, mStatePreservation);
         mModeManager.setPhase3Components(mCustomStore, mAppVisibility);
+        mModeManager.setPhase4Components(mBundleDownloadManager);
 
         publishBinderService(SERVICE_NAME, mBinder);
         Log.i(TAG, "CirclePersonalityManagerService started (v" + SERVICE_VERSION + ")");
@@ -194,6 +205,33 @@ public class CirclePersonalityManagerService extends SystemService {
 
         @Override public List<String> getModeHiddenApps(String modeId) {
             return mModeManager.getModeHiddenApps(modeId);
+        }
+
+        // Phase 4 ----
+
+        @Override public ModeBundle getBundleInfo(String modeId) {
+            return mBundleDownloadManager.getBundleInfo(modeId);
+        }
+
+        @Override public List<ModeBundle> getAvailableBundles() {
+            return mBundleDownloadManager.getAvailableBundles();
+        }
+
+        @Override public void downloadBundle(String modeId, IBundleCallback callback) {
+            if (modeId != null) mBundleDownloadManager.downloadBundle(modeId, callback);
+        }
+
+        @Override public void cancelBundleDownload(String modeId) {
+            if (modeId != null) mBundleDownloadManager.cancelBundleDownload(modeId);
+        }
+
+        @Override public boolean isBundleDownloaded(String modeId) {
+            return modeId != null && mBundleDownloadManager.isBundleDownloaded(modeId);
+        }
+
+        @Override public List<String> getBundleApps(String modeId) {
+            if (modeId == null) return new java.util.ArrayList<>();
+            return mBundleDownloadManager.getBundleApps(modeId);
         }
     };
 }
