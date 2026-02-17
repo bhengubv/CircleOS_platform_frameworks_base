@@ -40,6 +40,9 @@ class BundleDownloadManager {
         for (ModeBundle b : Tier2Modes.allBundles()) {
             mBundles.put(b.modeId, b);
         }
+        for (ModeBundle b : Tier3Modes.allBundles()) {
+            mBundles.put(b.modeId, b);
+        }
         // Mark bundles already recorded in store as downloaded
         for (ModeBundle b : mBundles.values()) {
             b.isDownloaded = mStore.isDownloaded(b.bundleId);
