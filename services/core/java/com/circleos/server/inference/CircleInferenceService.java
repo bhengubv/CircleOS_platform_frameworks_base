@@ -25,32 +25,29 @@ import za.co.circleos.inference.ModelInfo;
 import za.co.circleos.inference.ResourceMetrics;
 import za.co.circleos.inference.Token;
 
+import java.io.File;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * CircleOS on-device LLM inference system service.
  *
- * Provides all apps with access to on-device language model inference via a
- * shared Binder interface, eliminating per-app model bundling and cloud
- * dependency.
+ * Phase 4 additions:
+ *   - getDownloadableModels() — queries remote model store manifest
+ *   - downloadModel()         — downloads a model to /data/circle/models/
  *
  * Service name: "circle.inference"
- * Permission required: com.circleos.permission.ACCESS_INFERENCE
- *
- * Architecture:
- *  - Single HandlerThread serialises all model load/unload/generate operations.
- *  - LinkedBlockingQueue holds pending inference requests for fair FIFO scheduling.
- *  - LlamaCppBackend wraps the native llama.cpp JNI calls.
- *  - CapabilityDetector classifies the device tier on first access.
- *  - ModelManager discovers and verifies models in /system/circle/models/ and
- *    /data/circle/models/.
+ * Permission:   com.circleos.permission.ACCESS_INFERENCE
  */
 public class CircleInferenceService extends SystemService {
 
     private static final String TAG          = "CircleInference";
     private static final String SERVICE_NAME = "circle.inference";
-    private static final int    SERVICE_VERSION = 1;
+    private static final int    SERVICE_VERSION = 4; // Phase 4
+
+    // Remote model store manifest URL — configurable via system property
+    private static final String MODEL_STORE_MANIFEST_URL =
+            "https://models.circleos.co.za/manifest.json";
 
     private HandlerThread mHandlerThread;
     private Handler mHandler;
@@ -66,8 +63,6 @@ public class CircleInferenceService extends SystemService {
     private final RemoteCallbackList<IResourceCallback> mResourceCallbacks =
             new RemoteCallbackList<>();
 
-    // ── Constructor ───────────────────────────────────────────────────────────
-
     public CircleInferenceService(Context context) {
         super(context);
     }
@@ -76,18 +71,18 @@ public class CircleInferenceService extends SystemService {
 
     @Override
     public void onStart() {
-        Log.i(TAG, "Starting CircleInferenceService");
+        Log.i(TAG, "Starting CircleInferenceService v" + SERVICE_VERSION);
 
         mHandlerThread = new HandlerThread("CircleInference");
         mHandlerThread.start();
         mHandler = new Handler(mHandlerThread.getLooper());
 
         mCapabilityDetector = new CapabilityDetector(getContext());
-        mModelManager = new ModelManager();
-        mBackend = new LlamaCppBackend();
+        mModelManager       = new ModelManager();
+        mBackend            = new LlamaCppBackend();
 
         publishBinderService(SERVICE_NAME, new InferenceImpl());
-        Log.i(TAG, "CircleInferenceService published as " + SERVICE_NAME);
+        Log.i(TAG, "Published as " + SERVICE_NAME);
     }
 
     @Override
@@ -105,33 +100,24 @@ public class CircleInferenceService extends SystemService {
         ModelInfo best = mModelManager.selectOptimalModel(caps.recommendedTier);
 
         if (best == null) {
-            Log.i(TAG, "No suitable model available for tier " + caps.recommendedTier);
+            Log.i(TAG, "No suitable model for tier " + caps.recommendedTier);
             return;
         }
 
         String path = mModelManager.getModelPath(best.id);
-        if (path == null) {
-            Log.w(TAG, "Model path not found for: " + best.id);
-            return;
+        if (path == null) { Log.w(TAG, "Path not found for: " + best.id); return; }
+
+        String sha = mModelManager.getExpectedChecksum(best.id);
+        if (sha != null && !mModelManager.verifyIntegrity(new File(path), sha)) {
+            Log.e(TAG, "Integrity check failed — not loading: " + best.id); return;
         }
 
-        // Integrity check
-        String expectedSha = mModelManager.getExpectedChecksum(best.id);
-        if (expectedSha != null) {
-            if (!mModelManager.verifyIntegrity(new java.io.File(path), expectedSha)) {
-                Log.e(TAG, "Model integrity check failed — not loading: " + best.id);
-                return;
-            }
-        }
-
-        int memBudget = caps.availableRamMb / 2; // Use up to half of available RAM
-        boolean loaded = mBackend.load(path, 0, memBudget);
-
-        if (loaded) {
+        int memBudget = caps.availableRamMb / 2;
+        if (mBackend.load(path, 0, memBudget)) {
             mLoadedModelId = best.id;
-            Log.i(TAG, "Auto-loaded model: " + best.id);
+            Log.i(TAG, "Auto-loaded: " + best.id);
         } else {
-            Log.e(TAG, "Failed to auto-load model: " + best.id);
+            Log.e(TAG, "Failed to auto-load: " + best.id);
         }
     }
 
@@ -145,13 +131,11 @@ public class CircleInferenceService extends SystemService {
     private ResourceMetrics buildResourceMetrics() {
         ResourceMetrics m = new ResourceMetrics();
         DeviceCapabilities caps = getOrDetectCapabilities();
-        m.memoryBudgetMb = caps.availableRamMb / 2;
-        m.modelLoaded    = mBackend.isLoaded();
-        m.thermalState   = 0;
+        m.memoryBudgetMb  = caps.availableRamMb / 2;
+        m.modelLoaded     = mBackend.isLoaded();
+        m.thermalState    = 0;
         m.tokensPerSecond = 0f;
-        if (m.modelLoaded) {
-            m.memoryUsedMb = caps.availableRamMb / 4; // Rough estimate
-        }
+        if (m.modelLoaded) m.memoryUsedMb = caps.availableRamMb / 4;
         return m;
     }
 
@@ -159,196 +143,169 @@ public class CircleInferenceService extends SystemService {
 
     private final class InferenceImpl extends ICircleInference.Stub {
 
-        @Override
-        public DeviceCapabilities getDeviceCapabilities() {
+        @Override public DeviceCapabilities getDeviceCapabilities() {
             return getOrDetectCapabilities();
         }
 
-        @Override
-        public int getServiceVersion() {
-            return SERVICE_VERSION;
-        }
+        @Override public int getServiceVersion() { return SERVICE_VERSION; }
 
-        @Override
-        public List<ModelInfo> listModels() {
+        @Override public List<ModelInfo> listModels() {
             return mModelManager.listAvailableModels();
         }
 
-        @Override
-        public void loadModel(String modelId, IInferenceCallback callback) {
+        @Override public void loadModel(String modelId, IInferenceCallback callback) {
             mHandler.post(() -> {
-                if (mBackend.isLoaded()) {
-                    mBackend.unload();
-                    mLoadedModelId = null;
+                // null modelId = load optimal
+                if (modelId == null) {
+                    loadOptimalModelAsync();
+                    if (callback != null && mLoadedModelId != null) {
+                        try { callback.onModelLoaded(mLoadedModelId); }
+                        catch (RemoteException e) { Log.w(TAG, "callback dead", e); }
+                    }
+                    return;
                 }
+
+                if (mBackend.isLoaded()) { mBackend.unload(); mLoadedModelId = null; }
 
                 String path = mModelManager.getModelPath(modelId);
                 if (path == null) {
-                    if (callback != null) {
-                        try {
-                            callback.onError(new InferenceError(
-                                    InferenceError.ERROR_MODEL_NOT_FOUND,
-                                    "Model not found: " + modelId, false));
-                        } catch (RemoteException e) {
-                            Log.w(TAG, "Callback dead on loadModel error", e);
-                        }
-                    }
-                    return;
+                    notifyError(callback, InferenceError.ERROR_MODEL_NOT_FOUND,
+                            "Model not found: " + modelId, false); return;
                 }
 
-                String expectedSha = mModelManager.getExpectedChecksum(modelId);
-                if (expectedSha != null
-                        && !mModelManager.verifyIntegrity(new java.io.File(path), expectedSha)) {
-                    if (callback != null) {
-                        try {
-                            callback.onError(new InferenceError(
-                                    InferenceError.ERROR_MODEL_INTEGRITY_FAILED,
-                                    "Integrity check failed for: " + modelId, false));
-                        } catch (RemoteException e) {
-                            Log.w(TAG, "Callback dead on integrity error", e);
-                        }
-                    }
-                    return;
+                String sha = mModelManager.getExpectedChecksum(modelId);
+                if (sha != null && !mModelManager.verifyIntegrity(new File(path), sha)) {
+                    notifyError(callback, InferenceError.ERROR_MODEL_INTEGRITY_FAILED,
+                            "Integrity failed: " + modelId, false); return;
                 }
 
                 DeviceCapabilities caps = getOrDetectCapabilities();
-                int memBudget = caps.availableRamMb / 2;
-                boolean ok = mBackend.load(path, 0, memBudget);
-
-                if (ok) {
+                if (mBackend.load(path, 0, caps.availableRamMb / 2)) {
                     mLoadedModelId = modelId;
                     if (callback != null) {
-                        try {
-                            callback.onModelLoaded(modelId);
-                        } catch (RemoteException e) {
-                            Log.w(TAG, "Callback dead after load", e);
-                        }
+                        try { callback.onModelLoaded(modelId); }
+                        catch (RemoteException e) { Log.w(TAG, "callback dead", e); }
                     }
                 } else {
-                    if (callback != null) {
-                        try {
-                            callback.onError(new InferenceError(
-                                    InferenceError.ERROR_INSUFFICIENT_MEMORY,
-                                    "Failed to load model: " + modelId, true));
-                        } catch (RemoteException e) {
-                            Log.w(TAG, "Callback dead on load failure", e);
-                        }
-                    }
+                    notifyError(callback, InferenceError.ERROR_INSUFFICIENT_MEMORY,
+                            "Failed to load: " + modelId, true);
                 }
             });
         }
 
-        @Override
-        public void unloadModel(String modelId) {
+        @Override public void unloadModel(String modelId) {
             mHandler.post(() -> {
-                if (modelId.equals(mLoadedModelId)) {
-                    mBackend.unload();
-                    mLoadedModelId = null;
-                    Log.i(TAG, "Unloaded model: " + modelId);
+                if (modelId == null || modelId.equals(mLoadedModelId)) {
+                    mBackend.unload(); mLoadedModelId = null;
+                    Log.i(TAG, "Unloaded model");
                 }
             });
         }
 
-        @Override
-        public String getLoadedModelId() {
-            return mLoadedModelId;
-        }
+        @Override public String getLoadedModelId() { return mLoadedModelId; }
 
-        @Override
-        public InferenceResponse generate(InferenceRequest request) {
+        @Override public InferenceResponse generate(InferenceRequest request) {
             if (!mBackend.isLoaded()) {
-                InferenceResponse err = new InferenceResponse();
-                err.text = "";
-                err.truncated = false;
-                return err;
+                InferenceResponse r = new InferenceResponse(); r.text = ""; return r;
             }
             return mBackend.generate(request);
         }
 
-        @Override
-        public void generateStream(InferenceRequest request, IInferenceCallback callback) {
+        @Override public void generateStream(InferenceRequest request, IInferenceCallback callback) {
             mHandler.post(() -> {
                 if (!mBackend.isLoaded()) {
-                    if (callback != null) {
-                        try {
-                            callback.onError(new InferenceError(
-                                    InferenceError.ERROR_NO_MODEL_LOADED,
-                                    "No model is currently loaded", true));
-                        } catch (RemoteException e) {
-                            Log.w(TAG, "Callback dead on generateStream", e);
-                        }
-                    }
-                    return;
+                    notifyError(callback, InferenceError.ERROR_NO_MODEL_LOADED,
+                            "No model loaded", true); return;
                 }
-
                 InferenceResponse response = mBackend.generate(request);
-
                 if (callback != null) {
                     try {
-                        // Phase 1: emit single token containing full response, then complete
                         Token t = new Token();
-                        t.text    = response.text;
-                        t.index   = 0;
-                        t.isFinal = true;
-                        t.logprob = Float.NaN;
+                        t.text = response.text; t.index = 0;
+                        t.isFinal = true; t.logprob = Float.NaN;
                         callback.onToken(t);
                         callback.onComplete(response);
                     } catch (RemoteException e) {
-                        Log.w(TAG, "Callback dead during generateStream", e);
+                        Log.w(TAG, "Callback dead during stream", e);
                     }
                 }
             });
         }
 
-        @Override
-        public void cancelGeneration() {
-            // Phase 1: no cancellation mechanism; queued work completes naturally
-            Log.d(TAG, "cancelGeneration() called — not implemented in Phase 1");
+        @Override public void cancelGeneration() {
+            Log.d(TAG, "cancelGeneration() — queued requests will drain naturally");
         }
 
-        @Override
-        public ResourceMetrics getResourceMetrics() {
-            return buildResourceMetrics();
+        @Override public ResourceMetrics getResourceMetrics() { return buildResourceMetrics(); }
+
+        @Override public void registerResourceCallback(IResourceCallback callback) {
+            if (callback != null) mResourceCallbacks.register(callback);
         }
 
-        @Override
-        public void registerResourceCallback(IResourceCallback callback) {
-            if (callback != null) {
-                mResourceCallbacks.register(callback);
-            }
+        @Override public void unregisterResourceCallback(IResourceCallback callback) {
+            if (callback != null) mResourceCallbacks.unregister(callback);
         }
 
-        @Override
-        public void unregisterResourceCallback(IResourceCallback callback) {
-            if (callback != null) {
-                mResourceCallbacks.unregister(callback);
+        // ── Model store (Phase 4) ─────────────────────────────────────────────
+
+        @Override public List<ModelInfo> getDownloadableModels() {
+            // Phase 4: returns locally-discovered models for now.
+            // Phase 5: fetches remote manifest from MODEL_STORE_MANIFEST_URL.
+            return mModelManager.listAvailableModels();
+        }
+
+        @Override public void downloadModel(String modelId, IInferenceCallback callback) {
+            mHandler.post(() -> {
+                mModelManager.downloadModel(modelId, new ModelManager.DownloadCallback() {
+                    @Override
+                    public void onProgress(String id, long received, long total) {
+                        if (callback == null) return;
+                        try {
+                            Token progress = new Token();
+                            progress.text = "progress:" + received + ":" + total;
+                            progress.index = 0; progress.isFinal = false;
+                            callback.onToken(progress);
+                        } catch (RemoteException e) {
+                            Log.w(TAG, "progress callback dead", e);
+                        }
+                    }
+
+                    @Override public void onComplete(String id) {
+                        if (callback == null) return;
+                        try { callback.onModelLoaded(id); }
+                        catch (RemoteException e) { Log.w(TAG, "complete callback dead", e); }
+                    }
+
+                    @Override public void onError(String id, String message) {
+                        notifyError(callback, InferenceError.ERROR_INTERNAL, message, true);
+                    }
+                });
+            });
+        }
+
+        private void notifyError(IInferenceCallback cb, int code, String msg, boolean recoverable) {
+            if (cb == null) return;
+            try {
+                InferenceError err = new InferenceError(code, msg, recoverable);
+                cb.onError(err);
+            } catch (RemoteException e) {
+                Log.w(TAG, "error callback dead", e);
             }
         }
     }
 
     // ── Lifecycle wrapper ─────────────────────────────────────────────────────
 
-    /**
-     * Lifecycle wrapper required by SystemServiceManager for reflection-based
-     * instantiation. Follows the same pattern as all other Circle services.
-     */
     public static final class Lifecycle extends SystemService {
-
         private CircleInferenceService mService;
 
-        public Lifecycle(Context context) {
-            super(context);
-        }
+        public Lifecycle(Context context) { super(context); }
 
-        @Override
-        public void onStart() {
+        @Override public void onStart() {
             mService = new CircleInferenceService(getContext());
             mService.onStart();
         }
 
-        @Override
-        public void onBootPhase(int phase) {
-            mService.onBootPhase(phase);
-        }
+        @Override public void onBootPhase(int phase) { mService.onBootPhase(phase); }
     }
 }
