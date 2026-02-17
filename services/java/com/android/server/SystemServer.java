@@ -236,6 +236,11 @@ import com.android.server.wm.WindowManagerGlobalLock;
 import com.android.server.wm.WindowManagerService;
 import com.circleos.server.privacy.CirclePrivacyManagerService;
 import com.circleos.server.privacy.CirclePermissionService;
+import com.circleos.server.notification.NotificationPrivacyService;
+import com.circleos.server.clipboard.ClipboardPrivacyService;
+import com.circleos.server.analytics.PrivacyAnalyticsService;
+import com.circleos.server.camera.CameraPrivacyIndicatorService;
+import com.circleos.server.backup.CircleBackupService;
 
 import dalvik.system.VMRuntime;
 
@@ -2844,6 +2849,27 @@ public final class SystemServer implements Dumpable {
 
         t.traceBegin("StartCirclePermissionService");
         mSystemServiceManager.startService(CirclePermissionService.Lifecycle.class);
+        t.traceEnd();
+
+        // Circle OS Phase 5 Services
+        t.traceBegin("StartCircleNotificationPrivacyService");
+        mSystemServiceManager.startService(NotificationPrivacyService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCircleClipboardPrivacyService");
+        mSystemServiceManager.startService(ClipboardPrivacyService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCirclePrivacyAnalyticsService");
+        mSystemServiceManager.startService(PrivacyAnalyticsService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCircleCameraPrivacyIndicatorService");
+        mSystemServiceManager.startService(CameraPrivacyIndicatorService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCircleBackupService");
+        mSystemServiceManager.startService(CircleBackupService.Lifecycle.class);
         t.traceEnd();
 
         t.traceBegin("AppServiceManager");
