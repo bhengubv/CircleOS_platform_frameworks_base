@@ -2118,6 +2118,8 @@
          <p>Protection level: normal -->
     <permission android:name="com.circleos.permission.ACCESS_INFERENCE"
         android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.ACCESS_PERSONALITY"
+        android:protectionLevel="normal" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
