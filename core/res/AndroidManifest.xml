@@ -2113,6 +2113,12 @@
     <permission android:name="com.circleos.permission.MANAGE_PRIVACY"
         android:protectionLevel="signature|privileged" />
 
+    <!-- Grants access to on-device LLM inference via CircleInferenceService.
+         Normal protection level allows any app to request this permission.
+         <p>Protection level: normal -->
+    <permission android:name="com.circleos.permission.ACCESS_INFERENCE"
+        android:protectionLevel="normal" />
+
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
     -->
