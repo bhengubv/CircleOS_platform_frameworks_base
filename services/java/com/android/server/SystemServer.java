@@ -248,6 +248,7 @@ import com.circleos.server.security.QuarantineManager;
 import com.circleos.server.security.CommunityDefenseService;
 import com.circleos.server.security.ResearcherApiService;
 import com.circleos.server.compression.CircleCompressionService;
+import com.circleos.server.sdpkt.SdpktTitaniumService;
 
 import dalvik.system.VMRuntime;
 
@@ -2905,6 +2906,10 @@ public final class SystemServer implements Dumpable {
 
         t.traceBegin("StartCircleCompressionService");
         mSystemServiceManager.startService(CircleCompressionService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartSdpktTitaniumService");
+        mSystemServiceManager.startService(SdpktTitaniumService.Lifecycle.class);
         t.traceEnd();
 
         t.traceBegin("AppServiceManager");

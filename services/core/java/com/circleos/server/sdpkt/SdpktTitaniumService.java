@@ -1,0 +1,259 @@
+/*
+ * Copyright (C) 2024 CircleOS
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package com.circleos.server.sdpkt;
+
+import android.content.Context;
+import android.os.HandlerThread;
+import android.util.Log;
+
+import com.android.server.SystemService;
+
+import za.co.circleos.sdpkt.IShongololoWallet;
+import za.co.circleos.sdpkt.NfcTransferRequest;
+import za.co.circleos.sdpkt.ShongololoTransaction;
+import za.co.circleos.sdpkt.TransactionResult;
+import za.co.circleos.sdpkt.WalletBalance;
+import za.co.circleos.sdpkt.WalletKey;
+
+import java.util.List;
+
+/**
+ * SDPKT Titanium System Service.
+ *
+ * Hardware-grade digital cash built into Circle OS.
+ * Service name: "circle.sdpkt"
+ *
+ * Architecture:
+ *   TeeKeyManager     — ECDSA keypair in Android Keystore (StrongBox/TEE)
+ *   TransactionSigner — sign outbound, verify inbound (offline)
+ *   NonceCache        — replay protection (24h nonce TTL)
+ *   WalletStore       — TEE-signed balance + transaction history
+ *   NfcProtocolEngine — SDPKT NFC handshake state machine
+ *
+ * NFC transport is handled by the SdpktTitanium privileged app
+ * (vendor/circle/apps/SdpktTitanium) which registers a HostApduService
+ * for AID F0:43:49:52:43:4C:45:53:44:50 and delegates protocol logic here
+ * via this Binder.
+ *
+ * Phase 1: Core wallet — TEE keys, NFC P2P, sign/verify, balance management
+ * Phase 2: Offline log, settlement queue, double-spend detection
+ * Phase 3: Protection Engine — location rules, stress detection
+ * Phase 4: Butler integration, Personality modes, lock screen quick pay
+ */
+public class SdpktTitaniumService extends SystemService {
+
+    private static final String TAG          = "SdpktTitanium";
+    public  static final String SERVICE_NAME = "circle.sdpkt";
+    public  static final int    VERSION      = 1;
+
+    private final BinderService  mBinderService = new BinderService();
+    private TeeKeyManager        mKeyManager;
+    private TransactionSigner    mSigner;
+    private NonceCache           mNonceCache;
+    private WalletStore          mWalletStore;
+    private NfcProtocolEngine    mNfcEngine;
+    private HandlerThread        mWorkerThread;
+    private android.os.Handler   mWorkerHandler;
+
+    /* ── Lifecycle ────────────────────────────────────── */
+
+    public static class Lifecycle extends SystemService {
+        private SdpktTitaniumService mService;
+        public Lifecycle(Context ctx) { super(ctx); }
+
+        @Override
+        public void onStart() {
+            mService = new SdpktTitaniumService(getContext());
+            mService.onStart();
+        }
+
+        @Override
+        public void onBootPhase(int phase) {
+            mService.onBootPhase(phase);
+        }
+    }
+
+    public SdpktTitaniumService(Context context) {
+        super(context);
+    }
+
+    @Override
+    public void onStart() {
+        publishBinderService(SERVICE_NAME, mBinderService);
+        Log.i(TAG, "SdpktTitaniumService started");
+    }
+
+    @Override
+    public void onBootPhase(int phase) {
+        if (phase == PHASE_BOOT_COMPLETED) {
+            mWorkerThread  = new HandlerThread("SdpktTitanium");
+            mWorkerThread.start();
+            mWorkerHandler = new android.os.Handler(mWorkerThread.getLooper());
+
+            mKeyManager  = new TeeKeyManager();
+            mSigner      = new TransactionSigner(mKeyManager);
+            mNonceCache  = new NonceCache();
+            mWalletStore = new WalletStore(mKeyManager);
+            mNfcEngine   = new NfcProtocolEngine(mKeyManager, mSigner, mNonceCache);
+
+            // Auto-initialize wallet if this is a fresh device
+            if (!mKeyManager.hasKey()) {
+                mWorkerHandler.post(() -> {
+                    WalletKey wk = mKeyManager.getOrCreateWalletKey();
+                    if (wk != null) {
+                        Log.i(TAG, "Wallet initialized — address: " + wk.shortAddress());
+                    }
+                });
+            }
+
+            Log.i(TAG, "SdpktTitaniumService boot-complete init done");
+        }
+    }
+
+    /* ── Binder ───────────────────────────────────────── */
+
+    private final class BinderService extends IShongololoWallet.Stub {
+
+        @Override
+        public boolean hasWallet() {
+            return mKeyManager != null && mKeyManager.hasKey();
+        }
+
+        @Override
+        public boolean initializeWallet() {
+            if (mKeyManager == null) return false;
+            WalletKey wk = mKeyManager.getOrCreateWalletKey();
+            if (wk != null) {
+                Log.i(TAG, "Wallet initialized on demand — address: " + wk.shortAddress());
+            }
+            return wk != null;
+        }
+
+        @Override
+        public WalletKey getWalletKey() {
+            if (mKeyManager == null) return null;
+            return mKeyManager.getOrCreateWalletKey();
+        }
+
+        @Override
+        public WalletBalance getBalance() {
+            if (mWalletStore == null) return new WalletBalance();
+            return mWalletStore.getBalance();
+        }
+
+        /* ── NFC session management ─────────────────── */
+
+        @Override
+        public String beginNfcSession(NfcTransferRequest request) {
+            if (mNfcEngine == null) return null;
+            if (request.amountCents <= 0) return null;
+            if (request.amountCents > mWalletStore.getBalance().availableCents) return null;
+
+            String sessionId = mNfcEngine.beginSenderSession(request);
+            Log.i(TAG, "NFC session started: " + sessionId
+                    + " amount=" + request.amountCents + " cents");
+            return sessionId;
+        }
+
+        @Override
+        public String processNfcMessage(String sessionId, String incomingBase64) {
+            if (mNfcEngine == null || sessionId == null) return null;
+
+            NfcProtocolEngine.Session s = mNfcEngine.getSession(sessionId);
+            if (s == null) {
+                // Unknown session — this is the receiver: create receiver session
+                String receiverSessionId = mNfcEngine.beginReceiverSession(incomingBase64);
+                if (receiverSessionId == null) return null;
+                // Build and return ADVERTISE response
+                return buildAdvertise(receiverSessionId);
+            }
+
+            return mNfcEngine.processMessage(sessionId, incomingBase64);
+        }
+
+        private String buildAdvertise(String sessionId) {
+            String pubkey = mKeyManager.getEncodedPublicKey();
+            if (pubkey == null) return null;
+            String deviceId;
+            try {
+                byte[] bytes = android.util.Base64.decode(pubkey, android.util.Base64.NO_WRAP);
+                deviceId = TeeKeyManager.sha256Hex(bytes);
+            } catch (Exception e) { deviceId = "unknown"; }
+            String json = "{\"type\":\"advertise\",\"pubkey\":\"" + pubkey
+                        + "\",\"device_id\":\"" + deviceId + "\",\"version\":1}";
+            // Encode as ADVERTISE message
+            byte[] jsonBytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] msg = new byte[1 + jsonBytes.length];
+            msg[0] = NfcProtocolEngine.MSG_ADVERTISE;
+            System.arraycopy(jsonBytes, 0, msg, 1, jsonBytes.length);
+            return android.util.Base64.encodeToString(msg, android.util.Base64.NO_WRAP);
+        }
+
+        @Override
+        public void cancelNfcSession(String sessionId) {
+            if (mNfcEngine != null) mNfcEngine.cancelSession(sessionId);
+        }
+
+        @Override
+        public TransactionResult acceptIncomingTransfer(String sessionId) {
+            if (mNfcEngine == null) return TransactionResult.fail(
+                    TransactionResult.ERR_INTERNAL, "Service not ready");
+
+            NfcProtocolEngine.Session s = mNfcEngine.getSession(sessionId);
+            if (s == null || s.pendingTx == null) return TransactionResult.fail(
+                    TransactionResult.ERR_INTERNAL, "No pending transaction");
+
+            ShongololoTransaction tx = s.pendingTx;
+            mWalletStore.credit(tx.amountCents);
+            mWalletStore.addTransaction(tx);
+
+            WalletBalance bal = mWalletStore.getBalance();
+            Log.i(TAG, "Received " + tx.amountCents + " cents from " + tx.senderDeviceId);
+            return TransactionResult.ok(tx.txId, bal.availableCents, bal.dailyRemainingCents());
+        }
+
+        @Override
+        public void declineIncomingTransfer(String sessionId) {
+            if (mNfcEngine != null) mNfcEngine.cancelSession(sessionId);
+            Log.i(TAG, "Incoming transfer declined: " + sessionId);
+        }
+
+        /* ── Transaction history ──────────────────── */
+
+        @Override
+        public List<ShongololoTransaction> getTransactions(int maxResults, long sinceEpochMs) {
+            if (mWalletStore == null) return new java.util.ArrayList<>();
+            return mWalletStore.getTransactions(maxResults, sinceEpochMs);
+        }
+
+        @Override
+        public ShongololoTransaction getTransaction(String txId) {
+            if (mWalletStore == null) return null;
+            return mWalletStore.getTransaction(txId);
+        }
+
+        /* ── Limits ──────────────────────────────── */
+
+        @Override
+        public long getPerTapLimitCents() {
+            return WalletStore.DEFAULT_PER_TAP_CENTS;
+        }
+
+        @Override
+        public long getDailyRemainingCents() {
+            if (mWalletStore == null) return 0;
+            return mWalletStore.getDailyRemainingCents();
+        }
+
+        @Override
+        public long getOfflineAccumulationCents() {
+            if (mWalletStore == null) return 0;
+            return mWalletStore.getOfflineAccumulationCents();
+        }
+
+        @Override
+        public int getServiceVersion() { return VERSION; }
+    }
+}

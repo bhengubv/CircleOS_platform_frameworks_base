@@ -2134,6 +2134,10 @@
         android:protectionLevel="signature|privileged" />
     <permission android:name="com.circleos.permission.ACCESS_COMPRESSION"
         android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.ACCESS_SDPKT"
+        android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.MANAGE_SDPKT"
+        android:protectionLevel="signature" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
