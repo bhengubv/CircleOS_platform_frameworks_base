@@ -1,0 +1,224 @@
+/*
+ * Copyright (C) 2024 CircleOS
+ * SPDX-License-Identifier: Apache-2.0
+ */
+package com.circleos.server.security;
+
+import android.content.Context;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.os.ParcelFileDescriptor;
+import android.util.Log;
+
+import com.android.server.SystemService;
+
+import za.co.circleos.security.DmzAnalysisResult;
+import za.co.circleos.security.ICircleFileDmz;
+import za.co.circleos.security.ThreatIndicator;
+
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Circle File DMZ System Service.
+ *
+ * Provides on-device file analysis: static scan → threat feed match →
+ * Content Disarm and Reconstruction (CDR).
+ *
+ * Service name: "circle.file_dmz"
+ */
+public class CircleFileDmzService extends SystemService {
+
+    private static final String TAG          = "CircleFileDmz";
+    public  static final String SERVICE_NAME = "circle.file_dmz";
+    public  static final int    VERSION      = 1;
+
+    private final BinderService mBinderService = new BinderService();
+    private ThreatFeedDatabase  mFeedDb;
+    private CdrProcessor        mCdrProcessor;
+    private HandlerThread       mWorkerThread;
+    private android.os.Handler  mWorkerHandler;
+
+    // Active analysis sessions: sessionId → result (null while in progress)
+    private final ConcurrentHashMap<String, DmzAnalysisResult> mSessions
+            = new ConcurrentHashMap<>();
+
+    /* ── Lifecycle ────────────────────────────────────────────────────── */
+
+    public static class Lifecycle extends SystemService {
+        private CircleFileDmzService mService;
+
+        public Lifecycle(Context ctx) { super(ctx); }
+
+        @Override
+        public void onStart() {
+            mService = new CircleFileDmzService(getContext());
+            mService.onStart();
+        }
+
+        @Override
+        public void onBootPhase(int phase) {
+            mService.onBootPhase(phase);
+        }
+    }
+
+    public CircleFileDmzService(Context context) {
+        super(context);
+    }
+
+    @Override
+    public void onStart() {
+        publishBinderService(SERVICE_NAME, mBinderService);
+        Log.i(TAG, "CircleFileDmzService started");
+    }
+
+    @Override
+    public void onBootPhase(int phase) {
+        if (phase == PHASE_BOOT_COMPLETED) {
+            mWorkerThread  = new HandlerThread("CircleFileDmz");
+            mWorkerThread.start();
+            mWorkerHandler = new android.os.Handler(mWorkerThread.getLooper());
+
+            mFeedDb       = new ThreatFeedDatabase();
+            mCdrProcessor = new CdrProcessor();
+
+            // Kick off initial feed update
+            mWorkerHandler.post(() -> {
+                ThreatFeedUpdater updater = new ThreatFeedUpdater(mFeedDb);
+                updater.updateIfStale();
+            });
+            Log.i(TAG, "CircleFileDmzService boot-complete init done");
+        }
+    }
+
+    /* ── Binder implementation ─────────────────────────────────────────── */
+
+    private final class BinderService extends ICircleFileDmz.Stub {
+
+        @Override
+        public String submitFile(ParcelFileDescriptor fileFd,
+                                 String fileName, String mimeType, String sourceApp) {
+            String sessionId = UUID.randomUUID().toString();
+            // Queue async analysis
+            mWorkerHandler.post(() -> analyzeFile(sessionId, fileFd, fileName, mimeType, sourceApp));
+            return sessionId;
+        }
+
+        @Override
+        public DmzAnalysisResult getResult(String sessionId) {
+            // Poll — caller should retry until non-null
+            return mSessions.get(sessionId);
+        }
+
+        @Override
+        public ParcelFileDescriptor getSanitizedFile(String sessionId) {
+            DmzAnalysisResult r = mSessions.get(sessionId);
+            if (r == null || !r.hasSanitizedVersion) return null;
+            return mCdrProcessor.getSanitizedFd(sessionId);
+        }
+
+        @Override
+        public void releaseSession(String sessionId) {
+            mSessions.remove(sessionId);
+            mCdrProcessor.releaseSession(sessionId);
+        }
+
+        @Override
+        public List<DmzAnalysisResult> listQuarantined() {
+            return mFeedDb.listQuarantined();
+        }
+
+        @Override
+        public void deleteQuarantined(String sessionId) {
+            mFeedDb.deleteQuarantined(sessionId);
+        }
+
+        @Override
+        public boolean isHashKnownMalicious(String sha256Hex) {
+            return mFeedDb != null && mFeedDb.isHashBlocked(sha256Hex);
+        }
+
+        @Override
+        public boolean isDomainBlacklisted(String domain) {
+            return mFeedDb != null && mFeedDb.isDomainBlocked(domain);
+        }
+
+        @Override
+        public boolean isIpBlacklisted(String ip) {
+            return mFeedDb != null && mFeedDb.isIpBlocked(ip);
+        }
+
+        @Override
+        public void triggerFeedUpdate() {
+            if (mWorkerHandler != null) {
+                mWorkerHandler.post(() -> new ThreatFeedUpdater(mFeedDb).forceUpdate());
+            }
+        }
+
+        @Override
+        public int getServiceVersion() {
+            return VERSION;
+        }
+    }
+
+    /* ── Analysis pipeline ─────────────────────────────────────────────── */
+
+    private void analyzeFile(String sessionId, ParcelFileDescriptor fileFd,
+                             String fileName, String mimeType, String sourceApp) {
+        long start = System.currentTimeMillis();
+        DmzAnalysisResult result = new DmzAnalysisResult();
+        result.sessionId    = sessionId;
+        result.fileName     = fileName;
+        result.mimeType     = mimeType;
+        result.sourceApp    = sourceApp;
+        result.stageReached = DmzAnalysisResult.STAGE_INTAKE;
+
+        try {
+            // Stage 1: SHA-256 + known-hash check
+            result.stageReached = DmzAnalysisResult.STAGE_STATIC;
+            String sha256 = hashFile(fileFd);
+            result.sha256 = sha256;
+
+            if (mFeedDb != null && mFeedDb.isHashBlocked(sha256)) {
+                result.verdict           = DmzAnalysisResult.VERDICT_THREAT;
+                result.knownMaliciousHash = true;
+                result.findings.add("File hash matches known malware: " + sha256);
+                mSessions.put(sessionId, result);
+                return;
+            }
+
+            // Stage 2: CDR (images and PDFs in Phase 1)
+            result.stageReached = DmzAnalysisResult.STAGE_CDR;
+            boolean sanitized = mCdrProcessor.process(sessionId, fileFd, mimeType, result);
+            if (sanitized) {
+                result.hasSanitizedVersion = true;
+                result.verdict = DmzAnalysisResult.VERDICT_SANITIZED;
+            } else {
+                result.verdict = DmzAnalysisResult.VERDICT_CLEAN;
+            }
+
+        } catch (Exception e) {
+            Log.e(TAG, "Analysis failed for " + sessionId, e);
+            result.verdict   = DmzAnalysisResult.VERDICT_ERROR;
+            result.errorCode = DmzAnalysisResult.ERROR_INTERNAL;
+        } finally {
+            result.analysisDurationMs = System.currentTimeMillis() - start;
+            mSessions.put(sessionId, result);
+            try { fileFd.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private String hashFile(ParcelFileDescriptor fileFd) throws Exception {
+        java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(fileFd.getFileDescriptor())) {
+            byte[] buf = new byte[65536];
+            int n;
+            while ((n = fis.read(buf)) != -1) md.update(buf, 0, n);
+        }
+        byte[] digest = md.digest();
+        StringBuilder sb = new StringBuilder(64);
+        for (byte b : digest) sb.append(String.format("%02x", b));
+        return sb.toString();
+    }
+}

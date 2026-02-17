@@ -2120,6 +2120,10 @@
         android:protectionLevel="normal" />
     <permission android:name="com.circleos.permission.ACCESS_PERSONALITY"
         android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.ACCESS_FILE_DMZ"
+        android:protectionLevel="normal" />
+    <permission android:name="com.circleos.permission.MANAGE_TRAFFIC_LOBBY"
+        android:protectionLevel="signature" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal

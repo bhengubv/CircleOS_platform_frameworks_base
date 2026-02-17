@@ -243,6 +243,7 @@ import com.circleos.server.camera.CameraPrivacyIndicatorService;
 import com.circleos.server.backup.CircleBackupService;
 import com.circleos.server.inference.CircleInferenceService;
 import com.circleos.server.personality.CirclePersonalityManagerService;
+import com.circleos.server.security.CircleFileDmzService;
 
 import dalvik.system.VMRuntime;
 
@@ -2880,6 +2881,10 @@ public final class SystemServer implements Dumpable {
 
         t.traceBegin("StartCirclePersonalityManagerService");
         mSystemServiceManager.startService(CirclePersonalityManagerService.Lifecycle.class);
+        t.traceEnd();
+
+        t.traceBegin("StartCircleFileDmzService");
+        mSystemServiceManager.startService(CircleFileDmzService.Lifecycle.class);
         t.traceEnd();
 
         t.traceBegin("AppServiceManager");
