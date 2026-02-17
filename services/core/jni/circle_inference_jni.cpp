@@ -3,103 +3,72 @@
  *
  * SPDX-License-Identifier: Apache-2.0
  *
- * Phase 1 JNI stub for the CircleOS on-device LLM inference service.
- *
- * These stubs allow the Java service to compile and link against a real
- * .so without requiring the full llama.cpp dependency tree in Phase 1.
- * Phase 2 will replace these stubs with real llama.cpp calls.
- *
- * Registered methods match the native declarations in LlamaCppBackend.java:
- *   private native long   nativeLoad(String modelPath, int contextSize, int memoryBudgetMb)
- *   private native String nativeGenerate(long handle, String prompt, int maxTokens, float temperature)
- *   private native void   nativeUnload(long handle)
+ * JNI bridge: LlamaCppBackend.java → Rust abstraction layer (Phase 2).
+ * Replaces Phase 1 stubs with real Rust C ABI calls.
  */
 
 #define LOG_TAG "CircleInference"
 #include <android/log.h>
 #include <jni.h>
+#include <cinttypes>
 #include <string>
+#include <vector>
+
+#include "circle_inference.h"
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// ---------------------------------------------------------------------------
-// Stub implementations
-// ---------------------------------------------------------------------------
+static constexpr int OUT_BUF_SIZE = 4 * 1024 * 1024; // 4 MB
 
-/**
- * nativeLoad — Phase 1 stub.
- * Returns a placeholder handle of 1 without loading any model.
- */
-static jlong nativeLoad(JNIEnv* env, jobject /* thiz */,
+static jlong nativeLoad(JNIEnv* env, jobject,
                         jstring modelPath, jint contextSize, jint memoryBudgetMb) {
     const char* path = env->GetStringUTFChars(modelPath, nullptr);
-    LOGI("nativeLoad stub: path=%s contextSize=%d memBudget=%dMB",
-         path ? path : "<null>", contextSize, memoryBudgetMb);
-    if (path) env->ReleaseStringUTFChars(modelPath, path);
-
-    // Phase 1: return a non-zero handle to indicate success
-    return static_cast<jlong>(1);
+    if (!path) { LOGE("nativeLoad: null path"); return 0L; }
+    int64_t handle = circle_inference_load(path, contextSize, memoryBudgetMb);
+    env->ReleaseStringUTFChars(modelPath, path);
+    if (!handle) LOGE("nativeLoad: load failed");
+    else LOGI("nativeLoad: handle=%" PRId64, handle);
+    return static_cast<jlong>(handle);
 }
 
-/**
- * nativeGenerate — Phase 1 stub.
- * Returns a fixed placeholder string.
- */
-static jstring nativeGenerate(JNIEnv* env, jobject /* thiz */,
-                              jlong handle, jstring prompt,
-                              jint maxTokens, jfloat temperature) {
-    LOGI("nativeGenerate stub: handle=%lld maxTokens=%d temperature=%.2f",
-         static_cast<long long>(handle), maxTokens, temperature);
-
-    std::string result = "[llama.cpp not yet linked]";
-    return env->NewStringUTF(result.c_str());
+static jstring nativeGenerate(JNIEnv* env, jobject,
+                               jlong handle, jstring prompt,
+                               jint maxTokens, jfloat temperature) {
+    const char* p = env->GetStringUTFChars(prompt, nullptr);
+    if (!p) { LOGE("nativeGenerate: null prompt"); return env->NewStringUTF(""); }
+    std::vector<char> buf(OUT_BUF_SIZE, '\0');
+    int32_t written = circle_inference_generate(
+        static_cast<int64_t>(handle), p, maxTokens, temperature,
+        buf.data(), OUT_BUF_SIZE);
+    env->ReleaseStringUTFChars(prompt, p);
+    if (written < 0) { LOGE("nativeGenerate: error"); return env->NewStringUTF(""); }
+    LOGI("nativeGenerate: %d bytes", written);
+    return env->NewStringUTF(buf.data());
 }
 
-/**
- * nativeUnload — Phase 1 stub.
- * No-op; there is nothing to free in Phase 1.
- */
-static void nativeUnload(JNIEnv* env, jobject /* thiz */, jlong handle) {
-    LOGI("nativeUnload stub: handle=%lld", static_cast<long long>(handle));
-    // Nothing to free in Phase 1
+static void nativeUnload(JNIEnv*, jobject, jlong handle) {
+    LOGI("nativeUnload: handle=%" PRId64, static_cast<int64_t>(handle));
+    circle_inference_unload(static_cast<int64_t>(handle));
 }
-
-// ---------------------------------------------------------------------------
-// JNI registration
-// ---------------------------------------------------------------------------
 
 static const JNINativeMethod kMethods[] = {
-    {"nativeLoad",     "(Ljava/lang/String;II)J",              (void*) nativeLoad},
+    {"nativeLoad",     "(Ljava/lang/String;II)J",               (void*) nativeLoad},
     {"nativeGenerate", "(JLjava/lang/String;IF)Ljava/lang/String;", (void*) nativeGenerate},
-    {"nativeUnload",   "(J)V",                                 (void*) nativeUnload},
+    {"nativeUnload",   "(J)V",                                  (void*) nativeUnload},
 };
 
-static const char* kClassName =
-    "com/circleos/server/inference/LlamaCppBackend";
-
-jint JNI_OnLoad(JavaVM* vm, void* /* reserved */) {
+jint JNI_OnLoad(JavaVM* vm, void*) {
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        LOGE("JNI_OnLoad: GetEnv failed");
-        return JNI_ERR;
+        LOGE("JNI_OnLoad: GetEnv failed"); return JNI_ERR;
     }
-
-    jclass cls = env->FindClass(kClassName);
-    if (cls == nullptr) {
-        LOGE("JNI_OnLoad: class not found: %s", kClassName);
-        return JNI_ERR;
+    jclass cls = env->FindClass("com/circleos/server/inference/LlamaCppBackend");
+    if (!cls) { LOGE("JNI_OnLoad: class not found"); return JNI_ERR; }
+    if (env->RegisterNatives(cls, kMethods, 3) != JNI_OK) {
+        LOGE("JNI_OnLoad: RegisterNatives failed"); return JNI_ERR;
     }
-
-    int rc = env->RegisterNatives(cls, kMethods,
-                                  static_cast<jint>(sizeof(kMethods) / sizeof(kMethods[0])));
-    if (rc != JNI_OK) {
-        LOGE("JNI_OnLoad: RegisterNatives failed: %d", rc);
-        return JNI_ERR;
-    }
-
-    LOGI("JNI_OnLoad: circle_inference registered (%zu methods)",
-         sizeof(kMethods) / sizeof(kMethods[0]));
+    LOGI("JNI_OnLoad: registered (native=%s)",
+         circle_inference_is_native_available() ? "yes" : "stub");
     return JNI_VERSION_1_6;
 }

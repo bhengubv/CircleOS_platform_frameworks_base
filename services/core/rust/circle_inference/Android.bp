@@ -1,0 +1,34 @@
+// Copyright (C) 2024 CircleOS
+//
+// SPDX-License-Identifier: Apache-2.0
+
+// Rust abstraction layer for CircleOS on-device LLM inference.
+// Compiled as a static library and linked into libcircle_inference.so
+// together with the JNI bridge in circle_inference_jni.cpp.
+
+rust_ffi_static {
+    name: "libcircle_inference_rust",
+    crate_name: "circle_inference",
+    srcs: ["src/lib.rs"],
+    rustlibs: [
+        "liblog_rust",
+    ],
+    host_supported: false,
+    apex_available: ["//apex_available:platform"],
+}
+
+cc_library_shared {
+    name: "libcircle_inference",
+    srcs: [
+        "../../jni/circle_inference_jni.cpp",
+    ],
+    static_libs: [
+        "libcircle_inference_rust",
+    ],
+    shared_libs: [
+        "liblog",
+    ],
+    export_include_dirs: ["include"],
+    local_include_dirs: ["include"],
+    apex_available: ["//apex_available:platform"],
+}

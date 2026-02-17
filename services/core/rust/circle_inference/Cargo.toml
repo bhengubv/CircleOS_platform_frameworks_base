@@ -1,0 +1,17 @@
+[package]
+name = "circle_inference"
+version = "0.2.0"
+edition = "2021"
+description = "CircleOS on-device LLM inference Rust abstraction layer"
+license = "Apache-2.0"
+
+[lib]
+name = "circle_inference"
+crate-type = ["staticlib", "rlib"]
+
+[features]
+default = []
+# Enable when llama.cpp native library is present and linked (Phase 3+)
+llama_native = []
+# Enable when BitNet.cpp is present (Phase 3)
+bitnet_native = []
