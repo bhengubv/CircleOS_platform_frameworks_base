@@ -11,6 +11,7 @@ import android.util.Log;
 import com.android.server.SystemService;
 
 import za.co.circleos.sdpkt.IShongololoWallet;
+import za.co.circleos.sdpkt.LocationContext;
 import za.co.circleos.sdpkt.NfcTransferRequest;
 import za.co.circleos.sdpkt.ShongololoTransaction;
 import za.co.circleos.sdpkt.SyncStatus;
@@ -51,7 +52,7 @@ public class SdpktTitaniumService extends SystemService {
 
     private static final String TAG          = "SdpktTitanium";
     public  static final String SERVICE_NAME = "circle.sdpkt";
-    public  static final int    VERSION      = 2;
+    public  static final int    VERSION      = 3;
 
     private final BinderService  mBinderService = new BinderService();
 
@@ -69,6 +70,11 @@ public class SdpktTitaniumService extends SystemService {
     private DoubleSpendDetector   mDSD;
     private SettlementQueue       mSettlementQueue;
     private SyncManager           mSyncManager;
+
+    /* ── Phase 3 components ──────────────────────────────── */
+    private WalletLocationManager mLocationManager;
+    private StressDetector        mStressDetector;
+    private ProtectionEngine      mProtectionEngine;
 
     /* ── Lifecycle ────────────────────────────────────────── */
 
@@ -127,6 +133,15 @@ public class SdpktTitaniumService extends SystemService {
             // Start connectivity listener
             mSyncManager.start();
 
+            // Phase 3 — Protection Engine
+            mLocationManager = new WalletLocationManager(getContext(), mWorkerHandler);
+            mStressDetector  = new StressDetector(getContext());
+            mProtectionEngine = new ProtectionEngine(
+                    getContext(), mLocationManager, mStressDetector,
+                    mWalletStore, mWorkerHandler);
+            mLocationManager.start();
+            mStressDetector.start(mWorkerHandler);
+
             // Auto-initialize wallet if this is a fresh device
             if (!mKeyManager.hasKey()) {
                 mWorkerHandler.post(() -> {
@@ -178,7 +193,22 @@ public class SdpktTitaniumService extends SystemService {
         public String beginNfcSession(NfcTransferRequest request) {
             if (mNfcEngine == null) return null;
             if (request.amountCents <= 0) return null;
-            if (request.amountCents > mWalletStore.getBalance().availableCents) return null;
+
+            // Phase 3: route through ProtectionEngine for all limit + stress checks.
+            // ProtectionEngine.evaluateTransfer() also calls WalletStore.debit() on success.
+            if (mProtectionEngine != null) {
+                TransactionResult gate = mProtectionEngine.evaluateTransfer(
+                        request.amountCents, request.lockScreenMode);
+                if (!gate.success) {
+                    // Return null — the calling app shows the appropriate error
+                    Log.i(TAG, "Transfer gated by ProtectionEngine: " + gate.errorMessage);
+                    return null;
+                }
+            } else {
+                // Pre-Phase-3 fallback
+                if (request.amountCents > mWalletStore.getBalance().availableCents) return null;
+                mWalletStore.debit(request.amountCents, request.lockScreenMode);
+            }
 
             String sessionId = mNfcEngine.beginSenderSession(request);
             Log.i(TAG, "NFC session started: " + sessionId
@@ -307,6 +337,26 @@ public class SdpktTitaniumService extends SystemService {
         public long getOfflineAccumulationCents() {
             if (mWalletStore == null) return 0;
             return mWalletStore.getOfflineAccumulationCents();
+        }
+
+        /* ── Phase 3: Protection Engine ──────────── */
+
+        @Override
+        public LocationContext getLocationContext() {
+            if (mProtectionEngine == null) {
+                return LocationContext.forType(LocationContext.TYPE_UNKNOWN, "", 0f);
+            }
+            return mProtectionEngine.getCurrentLocationContext();
+        }
+
+        @Override
+        public boolean isProtectionActive() {
+            return mProtectionEngine != null && mProtectionEngine.isProtectionActive();
+        }
+
+        @Override
+        public int getStressScore() {
+            return mProtectionEngine != null ? mProtectionEngine.getStressScore() : 0;
         }
 
         /* ── Phase 2: Settlement sync ─────────────── */

@@ -88,17 +88,28 @@ public class WalletStore {
     }
 
     /**
-     * Debit the wallet for an outbound transfer.
-     * Returns false if insufficient funds or limit exceeded.
+     * Debit the wallet for an outbound transfer using static default limits.
+     * Returns false if insufficient funds or any limit exceeded.
      */
     public boolean debit(long amountCents, boolean lockScreen) {
+        long perTapLimit = lockScreen ? DEFAULT_LOCKSCREEN_CENTS : DEFAULT_PER_TAP_CENTS;
+        return debit(amountCents, perTapLimit, DEFAULT_DAILY_CENTS);
+    }
+
+    /**
+     * Debit with caller-supplied per-tap and daily limits (Phase 3 — location-based limits).
+     * The offline accumulation cap is always enforced regardless of caller limits.
+     *
+     * @param perTapLimitCents  Effective per-tap limit for this context.
+     * @param dailyLimitCents   Effective daily limit for this context.
+     */
+    public boolean debit(long amountCents, long perTapLimitCents, long dailyLimitCents) {
         synchronized (mLock) {
             checkDailyReset();
-            long perTapLimit = lockScreen ? DEFAULT_LOCKSCREEN_CENTS : DEFAULT_PER_TAP_CENTS;
 
-            if (amountCents > perTapLimit)               return false;
-            if (amountCents > mBalanceCents)             return false;
-            if (mDailySpentCents + amountCents > DEFAULT_DAILY_CENTS) return false;
+            if (amountCents > perTapLimitCents)                              return false;
+            if (amountCents > mBalanceCents)                                 return false;
+            if (mDailySpentCents + amountCents > dailyLimitCents)            return false;
             if (mOfflineSpentCents + amountCents > DEFAULT_OFFLINE_CAP_CENTS) return false;
 
             mBalanceCents       -= amountCents;

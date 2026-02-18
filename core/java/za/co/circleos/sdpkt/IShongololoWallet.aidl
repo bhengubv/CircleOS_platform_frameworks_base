@@ -11,6 +11,7 @@ import za.co.circleos.sdpkt.TransactionResult;
 import za.co.circleos.sdpkt.NfcTransferRequest;
 import za.co.circleos.sdpkt.INfcTransferCallback;
 import za.co.circleos.sdpkt.SyncStatus;
+import za.co.circleos.sdpkt.LocationContext;
 
 /**
  * SDPKT Titanium wallet binder interface.
@@ -92,6 +93,17 @@ interface IShongololoWallet {
 
     /** Total offline spending since last sync, in cents. */
     long getOfflineAccumulationCents();
+
+    /* ── Protection Engine (Phase 3) ────────────────────── */
+
+    /** Current location context (type, limits, label, confidence). */
+    LocationContext getLocationContext();
+
+    /** True if stress/coercion protection is currently blocking transfers. */
+    boolean isProtectionActive();
+
+    /** 0–100 composite stress score (accelerometer + heart rate). */
+    int getStressScore();
 
     /* ── Settlement sync (Phase 2) ───────────────────────── */
 
