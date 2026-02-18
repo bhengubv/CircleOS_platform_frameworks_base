@@ -361,13 +361,37 @@ public final class CircleMeshService extends SystemService {
 
     // ── Message delivery ──────────────────────────────────────────────────────
 
+    /** Broadcast action fired to apps when a MSG_TEXT frame arrives. */
+    public static final String ACTION_MESSAGE_RECEIVED =
+            "za.co.circleos.mesh.action.MESSAGE_RECEIVED";
+    public static final String EXTRA_SENDER_ID = "sender_id";
+    public static final String EXTRA_MSG_TEXT  = "msg_text";
+
     /**
      * Called by {@link MeshRouter} when a frame addressed to us arrives.
      */
     private void onMessageDelivered(MeshProtocol.Message msg, String from) {
         Log.i(TAG, "Message delivered: type=0x" + Integer.toHexString(msg.type)
                 + " from=" + msg.getSenderHex() + " via=" + from);
-        // TODO: dispatch to per-capability handlers (OTA, MSG, TX, FILE, Butler)
+
+        if (msg.type == MeshProtocol.TYPE_MSG_TEXT && msg.payload != null) {
+            broadcastTextMessage(msg.getSenderHex(), msg.payload);
+        }
+        // TODO: route OTA, TX, FILE, Butler frames to their respective handlers
+    }
+
+    private void broadcastTextMessage(String senderId, byte[] payload) {
+        try {
+            String text = new String(payload, "UTF-8");
+            android.content.Intent intent = new android.content.Intent(ACTION_MESSAGE_RECEIVED);
+            intent.putExtra(EXTRA_SENDER_ID, senderId);
+            intent.putExtra(EXTRA_MSG_TEXT, text);
+            intent.setPackage("za.co.circleos.butler");
+            getContext().sendBroadcast(intent);
+            Log.d(TAG, "Broadcast MESSAGE_RECEIVED from " + senderId);
+        } catch (Exception e) {
+            Log.w(TAG, "broadcastTextMessage failed", e);
+        }
     }
 
     // ── Store-and-forward flush ───────────────────────────────────────────────
