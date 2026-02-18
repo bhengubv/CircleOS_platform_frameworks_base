@@ -4,7 +4,11 @@
  */
 package com.circleos.server.security;
 
+import android.content.ContentValues;
 import android.content.Context;
+import android.database.Cursor;
+import android.database.sqlite.SQLiteDatabase;
+import android.database.sqlite.SQLiteOpenHelper;
 import android.os.HandlerThread;
 import android.util.Log;
 
@@ -17,10 +21,10 @@ import za.co.circleos.security.IocBundle;
 import za.co.circleos.security.QuarantineRecord;
 import za.co.circleos.security.ThreatIndicator;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
-import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
  * Data Acuity Researcher API Service — Phase 3.
@@ -43,16 +47,46 @@ public class ResearcherApiService extends SystemService {
     public  static final String SERVICE_NAME = "circle.researcher_api";
     public  static final int    VERSION      = 1;
 
+    // ── SQLite IOC store ──────────────────────────────────────────────────
+
+    private static final String DB_PATH = "/data/circle/security/ioc_store.db";
+    private static final int    DB_VER  = 1;
+    private static final String T_IOCS  = "threat_indicators";
+
+    private static class IocDbHelper extends SQLiteOpenHelper {
+        IocDbHelper(Context ctx) {
+            super(ctx, DB_PATH, null, DB_VER);
+        }
+
+        @Override
+        public void onCreate(SQLiteDatabase db) {
+            db.execSQL("CREATE TABLE IF NOT EXISTS " + T_IOCS + " ("
+                    + "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    + "type INTEGER NOT NULL, "
+                    + "value TEXT NOT NULL, "
+                    + "confidence INTEGER NOT NULL, "
+                    + "source TEXT, "
+                    + "first_seen INTEGER NOT NULL, "
+                    + "last_seen INTEGER NOT NULL, "
+                    + "description TEXT, "
+                    + "UNIQUE(type, value) ON CONFLICT REPLACE)");
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_iocs_first_seen ON "
+                    + T_IOCS + "(first_seen)");
+            db.execSQL("CREATE INDEX IF NOT EXISTS idx_iocs_value ON "
+                    + T_IOCS + "(value)");
+        }
+
+        @Override
+        public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {}
+    }
+
     private final BinderService     mBinderService    = new BinderService();
     private IocExtractor            mIocExtractor;
     private CampaignCorrelator      mCorrelator;
     private InfrastructureMapper    mMapper;
     private HandlerThread           mWorkerThread;
     private android.os.Handler      mWorkerHandler;
-
-    // In-memory IOC store (Phase 3: replace with SQLite in Phase 4)
-    private final CopyOnWriteArrayList<ThreatIndicator> mAllIocs
-            = new CopyOnWriteArrayList<>();
+    private IocDbHelper             mIocDb;
 
     /* ── Lifecycle ────────────────────────────────────────────────────── */
 
@@ -79,8 +113,10 @@ public class ResearcherApiService extends SystemService {
 
     @Override
     public void onStart() {
+        new File("/data/circle/security").mkdirs();
+        mIocDb = new IocDbHelper(getContext());
         publishBinderService(SERVICE_NAME, mBinderService);
-        Log.i(TAG, "ResearcherApiService started");
+        Log.i(TAG, "ResearcherApiService started (IOC DB: " + DB_PATH + ")");
     }
 
     @Override
@@ -92,7 +128,8 @@ public class ResearcherApiService extends SystemService {
             mIocExtractor  = new IocExtractor();
             mCorrelator    = new CampaignCorrelator();
             mMapper        = new InfrastructureMapper();
-            Log.i(TAG, "ResearcherApiService boot-complete init done");
+            Log.i(TAG, "ResearcherApiService boot-complete init done, IOC count="
+                    + dbCountIocs());
         }
     }
 
@@ -103,7 +140,7 @@ public class ResearcherApiService extends SystemService {
         if (mWorkerHandler == null) return;
         mWorkerHandler.post(() -> {
             List<ThreatIndicator> iocs = mIocExtractor.extractFromDmzResult(result);
-            mAllIocs.addAll(iocs);
+            dbInsertIocs(iocs);
             List<String> campaigns = mCorrelator.correlate(iocs);
             mMapper.ingestCampaigns(mCorrelator.getAllCampaigns());
             Log.i(TAG, "Processed DMZ result → " + iocs.size() + " IOCs, "
@@ -116,7 +153,7 @@ public class ResearcherApiService extends SystemService {
         if (mWorkerHandler == null) return;
         mWorkerHandler.post(() -> {
             List<ThreatIndicator> iocs = mIocExtractor.extractFromQuarantine(record);
-            mAllIocs.addAll(iocs);
+            dbInsertIocs(iocs);
             mCorrelator.correlate(iocs);
             mMapper.ingestCampaigns(mCorrelator.getAllCampaigns());
         });
@@ -144,20 +181,18 @@ public class ResearcherApiService extends SystemService {
         public IocBundle getIocBundle(String campaignId) {
             AttackCampaign c = mCorrelator.getCampaign(campaignId);
             if (c == null) return null;
+            // Fetch IOCs whose value is in the campaign's IOC set.
             List<ThreatIndicator> campaignIocs = new ArrayList<>();
-            for (ThreatIndicator ti : mAllIocs) {
-                if (c.iocs.contains(ti.value)) campaignIocs.add(ti);
+            for (String iocValue : c.iocs) {
+                List<ThreatIndicator> matched = dbQueryByValue(iocValue);
+                campaignIocs.addAll(matched);
             }
             return buildStixBundle(campaignIocs, 1);
         }
 
         @Override
         public IocBundle getAllIocs(long sinceEpochMs, int maxResults) {
-            List<ThreatIndicator> filtered = new ArrayList<>();
-            for (ThreatIndicator ti : mAllIocs) {
-                if (ti.firstSeen >= sinceEpochMs) filtered.add(ti);
-                if (maxResults > 0 && filtered.size() >= maxResults) break;
-            }
+            List<ThreatIndicator> filtered = dbQuerySince(sinceEpochMs, maxResults);
             return buildStixBundle(filtered, mCorrelator.getAllCampaigns().size());
         }
 
@@ -183,11 +218,99 @@ public class ResearcherApiService extends SystemService {
 
         @Override
         public int getTotalIocs() {
-            return mAllIocs.size();
+            return dbCountIocs();
         }
 
         @Override
         public int getServiceVersion() { return VERSION; }
+    }
+
+    /* ── SQLite IOC helpers ───────────────────────────────────────────── */
+
+    /** Insert a list of ThreatIndicators. Uses CONFLICT REPLACE on (type, value). */
+    private void dbInsertIocs(List<ThreatIndicator> iocs) {
+        if (iocs == null || iocs.isEmpty()) return;
+        try {
+            SQLiteDatabase db = mIocDb.getWritableDatabase();
+            db.beginTransaction();
+            try {
+                for (ThreatIndicator ti : iocs) {
+                    ContentValues cv = new ContentValues(7);
+                    cv.put("type",        ti.type);
+                    cv.put("value",       ti.value);
+                    cv.put("confidence",  ti.confidence);
+                    cv.put("source",      ti.source);
+                    cv.put("first_seen",  ti.firstSeen);
+                    cv.put("last_seen",   ti.lastSeen);
+                    cv.put("description", ti.description);
+                    db.insertWithOnConflict(T_IOCS, null, cv,
+                            SQLiteDatabase.CONFLICT_REPLACE);
+                }
+                db.setTransactionSuccessful();
+            } finally {
+                db.endTransaction();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "dbInsertIocs failed", e);
+        }
+    }
+
+    /** Query IOCs with first_seen >= sinceEpochMs, optionally capped to maxResults. */
+    private List<ThreatIndicator> dbQuerySince(long sinceEpochMs, int maxResults) {
+        List<ThreatIndicator> result = new ArrayList<>();
+        try {
+            SQLiteDatabase db = mIocDb.getReadableDatabase();
+            String limit = maxResults > 0 ? String.valueOf(maxResults) : null;
+            try (Cursor c = db.query(T_IOCS, null,
+                    "first_seen >= ?", new String[]{String.valueOf(sinceEpochMs)},
+                    null, null, "first_seen ASC", limit)) {
+                while (c.moveToNext()) result.add(cursorToThreatIndicator(c));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "dbQuerySince failed", e);
+        }
+        return result;
+    }
+
+    /** Query IOCs matching a specific value (exact match). */
+    private List<ThreatIndicator> dbQueryByValue(String value) {
+        List<ThreatIndicator> result = new ArrayList<>();
+        try {
+            SQLiteDatabase db = mIocDb.getReadableDatabase();
+            try (Cursor c = db.query(T_IOCS, null,
+                    "value=?", new String[]{value},
+                    null, null, null, null)) {
+                while (c.moveToNext()) result.add(cursorToThreatIndicator(c));
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "dbQueryByValue failed for " + value, e);
+        }
+        return result;
+    }
+
+    /** Returns total row count in the IOC table. */
+    private int dbCountIocs() {
+        try {
+            SQLiteDatabase db = mIocDb.getReadableDatabase();
+            try (Cursor c = db.rawQuery("SELECT COUNT(*) FROM " + T_IOCS, null)) {
+                return c.moveToFirst() ? c.getInt(0) : 0;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "dbCountIocs failed", e);
+            return 0;
+        }
+    }
+
+    private static ThreatIndicator cursorToThreatIndicator(Cursor c) {
+        ThreatIndicator ti = new ThreatIndicator();
+        ti.type        = c.getInt(c.getColumnIndexOrThrow("type"));
+        ti.value       = c.getString(c.getColumnIndexOrThrow("value"));
+        ti.confidence  = c.getInt(c.getColumnIndexOrThrow("confidence"));
+        ti.source      = c.getString(c.getColumnIndexOrThrow("source"));
+        ti.firstSeen   = c.getLong(c.getColumnIndexOrThrow("first_seen"));
+        ti.lastSeen    = c.getLong(c.getColumnIndexOrThrow("last_seen"));
+        ti.description = c.getString(c.getColumnIndexOrThrow("description"));
+        return ti;
     }
 
     /* ── STIX 2.1 bundle builder ──────────────────────────────────────── */
