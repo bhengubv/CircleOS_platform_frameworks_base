@@ -6,66 +6,356 @@
 package com.circleos.server.update;
 
 import android.content.Context;
-import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.os.PowerManager;
-import android.os.RecoverySystem;
-import android.util.Slog;
+import android.os.IBinder;
+import android.os.ServiceManager;
+import android.os.SystemProperties;
+import android.util.Log;
 
 import com.android.server.SystemService;
 
+import za.co.circleos.update.ICircleUpdateService;
+
 import org.json.JSONObject;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.security.MessageDigest;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
 
 /**
- * Circle OS OTA (Over-The-Air) update service.
+ * CircleOS OTA update system service.
  *
- * Registered in SystemServer as "circle.update".
+ * Service name: {@value #SERVICE_NAME}
  *
- * Flow:
- *   1. Polls UPDATE_URL on check (manual or scheduled)
- *   2. Compares server version against ro.circle.version
- *   3. If newer: downloads OTA zip to /data/circle/ota/update.zip
- *   4. Verifies SHA-256 against manifest
- *   5. Passes to RecoverySystem.installPackage() → reboot into recovery
+ * Pipeline:
+ *   onBootCompleted() → (60 s delay) → triggerCheck()
+ *     → UpdateChecker.check() → no update → IDLE
+ *                              → update found → UpdateDownloader.download()
+ *                                → success → READY_TO_INSTALL + notification
+ *                                → failure → FAILED + notification
+ *   applyUpdate() → UpdateInstaller.install() → reboot (inside UpdateInstaller)
  *
- * A/B updates: uses RecoverySystem.scheduleUpdateFromFile() when
- * ro.virtual_ab.enabled=true (Pixel 6+).
- *
- * Update server manifest format (JSON):
- *   {
- *     "version": "0.2.0-alpha",
- *     "url": "https://updates.circleos.org/ota/circle-0.2.0-alpha.zip",
- *     "sha256": "abc123...",
- *     "size_bytes": 134217728,
- *     "changelog": "Bug fixes and security improvements"
- *   }
+ * Channel preference is persisted to {@value #PREFS_FILE}.
  */
 public class CircleUpdateService extends SystemService {
 
-    private static final String TAG        = "CircleUpdateService";
-    public  static final String SERVICE_NAME = "circle.update";
+    private static final String TAG = "CircleUpdateService";
 
-    private static final String UPDATE_URL =
-            "https://updates.circleos.org/api/v1/latest?channel=alpha&arch=" +
-            Build.CPU_ABI;
-    private static final String OTA_DIR   = "/data/circle/ota";
-    private static final String OTA_FILE  = OTA_DIR + "/update.zip";
+    public static final String SERVICE_NAME = "circle.update";
 
-    private final HandlerThread mThread;
-    private final Handler       mHandler;
+    private static final String UPDATE_DIR = "/data/system/circleos_update";
+    private static final String PREFS_FILE = UPDATE_DIR + "/prefs.json";
 
-    public static class Lifecycle extends SystemService {
+    private static final long   FIRST_CHECK_DELAY_MS = 60_000L; // 60 seconds after boot
+
+    // ── Singleton reference for static triggerCheck() ─────────────────────────
+    private static volatile CircleUpdateService sInstance;
+
+    // ── Instance fields ───────────────────────────────────────────────────────
+    private HandlerThread mHandlerThread;
+    private Handler       mHandler;
+
+    private UpdateChecker             mChecker;
+    private UpdateDownloader          mDownloader;
+    private UpdateInstaller           mInstaller;
+    private UpdateNotificationManager mNotifManager;
+    private UpdateScheduler.UpdateCheckReceiver mCheckReceiver;
+
+    private volatile int    mState           = UpdateState.IDLE;
+    private volatile String mAvailableVersion;
+    private volatile int    mDownloadProgress = -1;
+    private volatile long   mLastCheckTime    = 0L;
+
+    /** Currently downloaded OTA file, ready to install. */
+    private volatile File   mDownloadedFile;
+
+    /** User-persisted channel override; null means use build property. */
+    private volatile String mChannelOverride;
+
+    // ── Constructor ───────────────────────────────────────────────────────────
+
+    public CircleUpdateService(Context context) {
+        super(context);
+        sInstance = this;
+    }
+
+    // ── SystemService lifecycle ───────────────────────────────────────────────
+
+    @Override
+    public void onStart() {
+        Log.i(TAG, "Starting CircleUpdateService");
+
+        mHandlerThread = new HandlerThread("CircleUpdate");
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper());
+
+        mChecker      = new UpdateChecker(getContext());
+        mDownloader   = new UpdateDownloader(getContext());
+        mInstaller    = new UpdateInstaller(getContext());
+        mNotifManager = new UpdateNotificationManager(getContext());
+
+        // Ensure update directory exists
+        new File(UPDATE_DIR).mkdirs();
+
+        // Load persisted preferences
+        loadPrefs();
+
+        publishBinderService(SERVICE_NAME, mBinder);
+        Log.i(TAG, "Published as " + SERVICE_NAME);
+    }
+
+    @Override
+    public void onBootPhase(int phase) {
+        if (phase == SystemService.PHASE_BOOT_COMPLETED) {
+            onBootCompleted();
+        }
+    }
+
+    // ── Boot handling ─────────────────────────────────────────────────────────
+
+    void onBootCompleted() {
+        Log.i(TAG, "Boot completed — scheduling update checks");
+
+        // Register the alarm receiver programmatically
+        mCheckReceiver = new UpdateScheduler.UpdateCheckReceiver();
+        getContext().registerReceiver(
+                mCheckReceiver,
+                UpdateScheduler.buildIntentFilter(),
+                Context.RECEIVER_NOT_EXPORTED);
+
+        // Schedule the 12-hour repeating alarm
+        UpdateScheduler.schedule(getContext());
+
+        // Trigger first check after a short delay to not burden early boot
+        mHandler.postDelayed(this::runCheck, FIRST_CHECK_DELAY_MS);
+    }
+
+    // ── Package-private: called by UpdateScheduler ───────────────────────────
+
+    /**
+     * Static entry point called by {@link UpdateScheduler.UpdateCheckReceiver}.
+     * Delegates to the live singleton instance, if one exists.
+     */
+    static void triggerCheck() {
+        CircleUpdateService svc = sInstance;
+        if (svc == null) {
+            Log.w(TAG, "triggerCheck() called before service started");
+            return;
+        }
+        svc.mHandler.post(svc::runCheck);
+    }
+
+    // ── Core pipeline ─────────────────────────────────────────────────────────
+
+    private void runCheck() {
+        if (mState == UpdateState.CHECKING
+                || mState == UpdateState.DOWNLOADING
+                || mState == UpdateState.INSTALLING) {
+            Log.d(TAG, "Check skipped — already in state " + UpdateState.name(mState));
+            return;
+        }
+
+        Log.i(TAG, "Running update check");
+        setState(UpdateState.CHECKING);
+
+        // Apply current channel override to checker
+        mChecker.setChannelOverride(mChannelOverride);
+
+        UpdateChecker.UpdateInfo info;
+        try {
+            info = mChecker.check();
+        } catch (Exception e) {
+            Log.e(TAG, "Unexpected error during update check", e);
+            info = null;
+        }
+
+        mLastCheckTime = System.currentTimeMillis();
+
+        if (info == null) {
+            Log.i(TAG, "Update check failed or returned null — going IDLE");
+            setState(UpdateState.IDLE);
+            return;
+        }
+
+        if (!info.hasUpdate) {
+            Log.i(TAG, "Device is up to date");
+            setState(UpdateState.IDLE);
+            return;
+        }
+
+        Log.i(TAG, "Update available: " + info.version + " from " + info.manifestUrl);
+        mAvailableVersion = info.version;
+        startDownload(info);
+    }
+
+    private void startDownload(final UpdateChecker.UpdateInfo info) {
+        setState(UpdateState.DOWNLOADING);
+        mDownloadProgress = 0;
+        mNotifManager.showDownloading(0);
+
+        mHandler.post(() -> {
+            try {
+                File downloaded = mDownloader.download(
+                        info.manifestUrl,
+                        info.version,
+                        percent -> {
+                            mDownloadProgress = percent;
+                            mNotifManager.showDownloading(percent);
+                        });
+
+                mDownloadedFile = downloaded;
+                mDownloadProgress = 100;
+                setState(UpdateState.READY_TO_INSTALL);
+                mNotifManager.showReadyToInstall(info.version);
+                Log.i(TAG, "Download complete: " + downloaded.getAbsolutePath());
+
+            } catch (Exception e) {
+                Log.e(TAG, "Download failed", e);
+                mDownloadProgress = -1;
+                setState(UpdateState.FAILED);
+                mNotifManager.showFailed(e.getMessage() != null
+                        ? e.getMessage() : "Download error");
+            }
+        });
+    }
+
+    private void applyUpdateInternal() {
+        File file = mDownloadedFile;
+        if (file == null || !file.exists()) {
+            Log.e(TAG, "applyUpdate() called but no downloaded file found");
+            setState(UpdateState.FAILED);
+            mNotifManager.showFailed("Update file not found");
+            return;
+        }
+
+        setState(UpdateState.INSTALLING);
+        mNotifManager.cancel();
+
+        mHandler.post(() -> {
+            try {
+                mInstaller.install(file, null /* callback — reboot handled inside installer */);
+            } catch (IOException e) {
+                Log.e(TAG, "Install failed", e);
+                setState(UpdateState.FAILED);
+                mNotifManager.showFailed(e.getMessage() != null
+                        ? e.getMessage() : "Install error");
+            }
+        });
+    }
+
+    // ── State helpers ─────────────────────────────────────────────────────────
+
+    private void setState(int newState) {
+        Log.d(TAG, "State: " + UpdateState.name(mState) + " -> " + UpdateState.name(newState));
+        mState = newState;
+    }
+
+    // ── Preferences ───────────────────────────────────────────────────────────
+
+    private void loadPrefs() {
+        File prefsFile = new File(PREFS_FILE);
+        if (!prefsFile.exists()) return;
+        try (FileReader reader = new FileReader(prefsFile)) {
+            StringBuilder sb = new StringBuilder();
+            char[] buf = new char[1024];
+            int n;
+            while ((n = reader.read(buf)) > 0) sb.append(buf, 0, n);
+            JSONObject obj = new JSONObject(sb.toString());
+            mChannelOverride = obj.optString("channel", null);
+            Log.d(TAG, "Loaded channel override: " + mChannelOverride);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to load prefs", e);
+        }
+    }
+
+    private void savePrefs() {
+        new File(UPDATE_DIR).mkdirs();
+        File prefsFile = new File(PREFS_FILE);
+        try (FileWriter writer = new FileWriter(prefsFile)) {
+            JSONObject obj = new JSONObject();
+            if (mChannelOverride != null) {
+                obj.put("channel", mChannelOverride);
+            }
+            writer.write(obj.toString());
+            Log.d(TAG, "Saved prefs: " + obj);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to save prefs", e);
+        }
+    }
+
+    // ── Binder implementation ─────────────────────────────────────────────────
+
+    final ICircleUpdateService.Stub mBinder = new ICircleUpdateService.Stub() {
+
+        @Override
+        public boolean checkNow() {
+            Log.i(TAG, "checkNow() requested via binder");
+            if (mState == UpdateState.CHECKING
+                    || mState == UpdateState.DOWNLOADING
+                    || mState == UpdateState.INSTALLING) {
+                return false;
+            }
+            mHandler.post(CircleUpdateService.this::runCheck);
+            return true;
+        }
+
+        @Override
+        public int getState() {
+            return mState;
+        }
+
+        @Override
+        public String getAvailableVersion() {
+            return mAvailableVersion;
+        }
+
+        @Override
+        public int getDownloadProgress() {
+            return mDownloadProgress;
+        }
+
+        @Override
+        public long getLastCheckTime() {
+            return mLastCheckTime;
+        }
+
+        @Override
+        public void applyUpdate() {
+            Log.i(TAG, "applyUpdate() requested via binder");
+            if (mState != UpdateState.READY_TO_INSTALL) {
+                Log.w(TAG, "applyUpdate() ignored — state is " + UpdateState.name(mState));
+                return;
+            }
+            applyUpdateInternal();
+        }
+
+        @Override
+        public String getChannel() {
+            if (mChannelOverride != null) return mChannelOverride;
+            return SystemProperties.get("ro.circleos.channel", "stable");
+        }
+
+        @Override
+        public void setChannel(String channel) {
+            Log.i(TAG, "setChannel: " + channel);
+            mChannelOverride = channel;
+            savePrefs();
+            // Trigger a fresh check on channel change (in background)
+            mHandler.post(CircleUpdateService.this::runCheck);
+        }
+    };
+
+    // ── Lifecycle wrapper ─────────────────────────────────────────────────────
+
+    /**
+     * SystemService lifecycle wrapper registered in SystemServer.
+     * Pattern mirrors {@code CircleInferenceService.Lifecycle}.
+     */
+    public static final class Lifecycle extends SystemService {
         private CircleUpdateService mService;
+
         public Lifecycle(Context context) { super(context); }
 
         @Override
@@ -73,130 +363,12 @@ public class CircleUpdateService extends SystemService {
             mService = new CircleUpdateService(getContext());
             mService.onStart();
         }
-    }
 
-    public CircleUpdateService(Context context) {
-        super(context);
-        mThread = new HandlerThread("CircleUpdateService");
-        mThread.start();
-        mHandler = new Handler(mThread.getLooper());
-    }
-
-    @Override
-    public void onStart() {
-        publishBinderService(SERVICE_NAME, new UpdateBinder());
-        Slog.i(TAG, "CircleUpdateService started");
-    }
-
-    @Override
-    public void onBootPhase(int phase) {
-        if (phase == SystemService.PHASE_BOOT_COMPLETED) {
-            // Schedule background check 10 minutes after boot
-            mHandler.postDelayed(this::checkForUpdate, 10 * 60 * 1000L);
-        }
-    }
-
-    // ---- Core update logic ----
-
-    public void checkForUpdate() {
-        mHandler.post(() -> {
-            try {
-                Slog.i(TAG, "Checking for OTA update…");
-                JSONObject manifest = fetchManifest();
-                if (manifest == null) return;
-
-                String serverVersion  = manifest.getString("version");
-                String currentVersion = Build.VERSION.INCREMENTAL; // ro.circle.version
-
-                if (isNewerVersion(serverVersion, currentVersion)) {
-                    Slog.i(TAG, "Update available: " + serverVersion);
-                    String url    = manifest.getString("url");
-                    String sha256 = manifest.getString("sha256");
-                    downloadAndInstall(url, sha256, serverVersion);
-                } else {
-                    Slog.i(TAG, "Circle OS is up to date (" + currentVersion + ")");
-                }
-            } catch (Exception e) {
-                Slog.e(TAG, "Update check failed", e);
+        @Override
+        public void onBootPhase(int phase) {
+            if (phase == PHASE_BOOT_COMPLETED) {
+                mService.onBootCompleted();
             }
-        });
-    }
-
-    private JSONObject fetchManifest() throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) new URL(UPDATE_URL).openConnection();
-        conn.setConnectTimeout(10_000);
-        conn.setReadTimeout(15_000);
-        try {
-            if (conn.getResponseCode() != 200) return null;
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader r = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                while ((line = r.readLine()) != null) sb.append(line);
-            }
-            return new JSONObject(sb.toString());
-        } finally {
-            conn.disconnect();
         }
     }
-
-    private void downloadAndInstall(String url, String expectedSha256, String version)
-            throws Exception {
-
-        new File(OTA_DIR).mkdirs();
-        File otaFile = new File(OTA_FILE);
-
-        Slog.i(TAG, "Downloading OTA: " + url);
-        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-        conn.setConnectTimeout(15_000);
-        conn.setReadTimeout(60_000);
-
-        try (InputStream in = conn.getInputStream();
-             FileOutputStream out = new FileOutputStream(otaFile)) {
-            byte[] buf = new byte[65536];
-            int len;
-            while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
-        } finally {
-            conn.disconnect();
-        }
-
-        // Verify SHA-256
-        if (!verifySha256(otaFile, expectedSha256)) {
-            Slog.e(TAG, "OTA SHA-256 mismatch — aborting");
-            otaFile.delete();
-            return;
-        }
-
-        Slog.i(TAG, "OTA verified, scheduling install");
-
-        // Install: A/B or classic recovery
-        boolean isAB = "true".equals(
-                android.os.SystemProperties.get("ro.virtual_ab.enabled", "false"));
-        if (isAB) {
-            RecoverySystem.scheduleUpdateFromFile(getContext(), otaFile, null, null);
-        } else {
-            RecoverySystem.installPackage(getContext(), otaFile);
-        }
-    }
-
-    private static boolean verifySha256(File file, String expected) throws Exception {
-        MessageDigest md = MessageDigest.getInstance("SHA-256");
-        try (InputStream in = new java.io.FileInputStream(file)) {
-            byte[] buf = new byte[65536];
-            int len;
-            while ((len = in.read(buf)) > 0) md.update(buf, 0, len);
-        }
-        byte[] digest = md.digest();
-        StringBuilder hex = new StringBuilder(64);
-        for (byte b : digest) hex.append(String.format("%02x", b));
-        return hex.toString().equalsIgnoreCase(expected);
-    }
-
-    private static boolean isNewerVersion(String server, String current) {
-        // Simple comparison on semver-like strings; good enough for alpha
-        return !server.equals(current) && server.compareTo(current) > 0;
-    }
-
-    // Stub binder — full AIDL in next iteration
-    private static class UpdateBinder extends android.os.Binder {}
 }

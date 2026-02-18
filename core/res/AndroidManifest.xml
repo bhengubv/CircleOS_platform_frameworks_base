@@ -2138,6 +2138,12 @@
         android:protectionLevel="normal" />
     <permission android:name="com.circleos.permission.MANAGE_SDPKT"
         android:protectionLevel="signature" />
+    <!-- CircleOS OTA Update Service -->
+    <permission android:name="com.circleos.permission.TRIGGER_UPDATE_CHECK"
+        android:protectionLevel="signature" />
+    <!-- CircleOS Mesh OTA Delivery -->
+    <permission android:name="com.circleos.permission.MESH_SHARE"
+        android:protectionLevel="normal" />
 
     <!-- Allows applications to access information about networks.
          <p>Protection level: normal
