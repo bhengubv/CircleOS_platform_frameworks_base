@@ -32,16 +32,19 @@ public final class DeviceLink implements Parcelable {
     public long   linkedAtMs;
     /** Unix ms of the most recent NFC transaction from this device. */
     public long   lastSeenMs;
+    /** Maximum transaction value in satoshis this device may initiate per session (0 = unlimited). */
+    public long   spendingLimitSats;
 
     public DeviceLink() {}
 
     protected DeviceLink(Parcel in) {
-        deviceId   = in.readString();
-        pubkeyHex  = in.readString();
-        label      = in.readString();
-        role       = in.readInt();
-        linkedAtMs = in.readLong();
-        lastSeenMs = in.readLong();
+        deviceId          = in.readString();
+        pubkeyHex         = in.readString();
+        label             = in.readString();
+        role              = in.readInt();
+        linkedAtMs        = in.readLong();
+        lastSeenMs        = in.readLong();
+        spendingLimitSats = in.readLong();
     }
 
     @Override
@@ -52,6 +55,7 @@ public final class DeviceLink implements Parcelable {
         dest.writeInt(role);
         dest.writeLong(linkedAtMs);
         dest.writeLong(lastSeenMs);
+        dest.writeLong(spendingLimitSats);
     }
 
     @Override

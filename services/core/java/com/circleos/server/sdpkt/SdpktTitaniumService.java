@@ -91,6 +91,11 @@ public class SdpktTitaniumService extends SystemService {
     private WearLinkManager        mWearLinkManager;
     private File                   mDataDir;
 
+    /* ── Phase 6: multi-device pairing ───────────────────── */
+    /** Map of deviceId → DeviceLink for all paired secondary devices. */
+    private final java.util.concurrent.ConcurrentHashMap<String, DeviceLink>
+            mLinkedDevices = new java.util.concurrent.ConcurrentHashMap<>();
+
     /* ── Lifecycle ────────────────────────────────────────── */
 
     public static class Lifecycle extends SystemService {
@@ -170,6 +175,9 @@ public class SdpktTitaniumService extends SystemService {
             mProtectionEngine.setPhase5Components(mProtectionLog, mCalibration);
             mWearLinkManager = new WearLinkManager(getContext(), mStressDetector);
             mWearLinkManager.start();
+
+            // Phase 6 — load persisted linked devices
+            loadLinkedDevices();
 
             // Auto-initialize wallet if this is a fresh device
             if (!mKeyManager.hasKey()) {
@@ -493,39 +501,130 @@ public class SdpktTitaniumService extends SystemService {
 
         @Override
         public List<DeviceLink> getLinkedDevices() {
-            // Phase 5 stub: returns only the primary device record.
-            // Full NFC tap-to-pair pairing protocol is Phase 6.
             List<DeviceLink> links = new ArrayList<>();
+            // Primary: this device's own wallet key
             WalletKey wk = mKeyManager != null ? mKeyManager.getOrCreateWalletKey() : null;
             if (wk != null) {
                 DeviceLink primary = new DeviceLink();
-                primary.deviceId   = wk.deviceId;
-                primary.pubkeyHex  = wk.publicKeyHex;
-                primary.label      = "This device";
-                primary.role       = DeviceLink.ROLE_PRIMARY;
-                primary.linkedAtMs = 0;
-                primary.lastSeenMs = System.currentTimeMillis();
+                primary.deviceId         = wk.deviceId;
+                primary.pubkeyHex        = wk.publicKeyHex;
+                primary.label            = "This device";
+                primary.role             = DeviceLink.ROLE_PRIMARY;
+                primary.linkedAtMs       = 0;
+                primary.lastSeenMs       = System.currentTimeMillis();
+                primary.spendingLimitSats = 0; // unlimited for primary
                 links.add(primary);
             }
+            // Secondary: all persisted linked devices
+            links.addAll(mLinkedDevices.values());
             return links;
         }
 
         @Override
         public boolean linkDevice(DeviceLink device) {
-            // Phase 5 stub — full pairing in Phase 6
-            Log.i(TAG, "linkDevice called: " + (device != null ? device.shortId() : "null"));
-            return false;
+            if (device == null
+                    || device.deviceId == null || device.deviceId.isEmpty()
+                    || device.pubkeyHex == null || device.pubkeyHex.isEmpty()) {
+                Log.w(TAG, "linkDevice: invalid device record");
+                return false;
+            }
+            // Reject attempt to link primary device as secondary
+            WalletKey wk = mKeyManager != null ? mKeyManager.getOrCreateWalletKey() : null;
+            if (wk != null && wk.deviceId.equals(device.deviceId)) {
+                Log.w(TAG, "linkDevice: cannot link primary device as secondary");
+                return false;
+            }
+            device.role       = DeviceLink.ROLE_SECONDARY;
+            device.linkedAtMs = System.currentTimeMillis();
+            mLinkedDevices.put(device.deviceId, device);
+            saveLinkedDevices();
+            Log.i(TAG, "Linked secondary device: " + device.shortId()
+                    + " label=" + device.label
+                    + " spendLimit=" + device.spendingLimitSats + " sats");
+            return true;
         }
 
         @Override
         public boolean unlinkDevice(String deviceId) {
-            Log.i(TAG, "unlinkDevice: " + deviceId);
-            return false;
+            if (deviceId == null || deviceId.isEmpty()) return false;
+            DeviceLink removed = mLinkedDevices.remove(deviceId);
+            if (removed == null) {
+                Log.w(TAG, "unlinkDevice: not found: " + deviceId);
+                return false;
+            }
+            saveLinkedDevices();
+            Log.i(TAG, "Unlinked device: " + removed.shortId());
+            return true;
         }
 
         /* ── Service info ─────────────────────────── */
 
         @Override
         public int getServiceVersion() { return VERSION; }
+    }
+
+    // ── Phase 6: linked device persistence ───────────────────────────────────
+
+    /**
+     * Loads linked device records from linked_devices.json in the SDPKT data dir.
+     * Format: JSON array of objects with fields matching DeviceLink fields.
+     */
+    private void loadLinkedDevices() {
+        if (mDataDir == null) return;
+        java.io.File file = new java.io.File(mDataDir, "linked_devices.json");
+        if (!file.exists()) return;
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray(readFileUtf8(file));
+            for (int i = 0; i < arr.length(); i++) {
+                org.json.JSONObject o = arr.getJSONObject(i);
+                DeviceLink dl = new DeviceLink();
+                dl.deviceId          = o.optString("deviceId");
+                dl.pubkeyHex         = o.optString("pubkeyHex");
+                dl.label             = o.optString("label", "Secondary device");
+                dl.role              = DeviceLink.ROLE_SECONDARY;
+                dl.linkedAtMs        = o.optLong("linkedAtMs", 0);
+                dl.lastSeenMs        = o.optLong("lastSeenMs", 0);
+                dl.spendingLimitSats = o.optLong("spendingLimitSats", 0);
+                if (dl.deviceId != null && !dl.deviceId.isEmpty()) {
+                    mLinkedDevices.put(dl.deviceId, dl);
+                }
+            }
+            Log.i(TAG, "Loaded " + mLinkedDevices.size() + " linked device(s) from disk");
+        } catch (Exception e) {
+            Log.w(TAG, "loadLinkedDevices failed", e);
+        }
+    }
+
+    /** Persists the current linked devices map to linked_devices.json. */
+    private void saveLinkedDevices() {
+        if (mDataDir == null) return;
+        java.io.File file = new java.io.File(mDataDir, "linked_devices.json");
+        try {
+            org.json.JSONArray arr = new org.json.JSONArray();
+            for (DeviceLink dl : mLinkedDevices.values()) {
+                org.json.JSONObject o = new org.json.JSONObject();
+                o.put("deviceId",          dl.deviceId);
+                o.put("pubkeyHex",         dl.pubkeyHex);
+                o.put("label",             dl.label != null ? dl.label : "");
+                o.put("linkedAtMs",        dl.linkedAtMs);
+                o.put("lastSeenMs",        dl.lastSeenMs);
+                o.put("spendingLimitSats", dl.spendingLimitSats);
+                arr.put(o);
+            }
+            try (java.io.FileOutputStream fos = new java.io.FileOutputStream(file)) {
+                fos.write(arr.toString().getBytes("UTF-8"));
+            }
+            Log.d(TAG, "Saved " + mLinkedDevices.size() + " linked device(s)");
+        } catch (Exception e) {
+            Log.w(TAG, "saveLinkedDevices failed", e);
+        }
+    }
+
+    private static String readFileUtf8(java.io.File f) throws java.io.IOException {
+        try (java.io.FileInputStream fis = new java.io.FileInputStream(f)) {
+            byte[] buf = new byte[(int) f.length()];
+            fis.read(buf);
+            return new String(buf, "UTF-8");
+        }
     }
 }
