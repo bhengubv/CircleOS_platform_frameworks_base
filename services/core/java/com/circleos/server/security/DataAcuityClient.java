@@ -65,7 +65,7 @@ public class DataAcuityClient {
      * Replace this placeholder with the real production key before shipping.
      */
     private static final String DATA_ACUITY_PUBKEY_B64 =
-            "MCowBQYDK2VwAyEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAX";
+            "MCowBQYDK2VwAyEA4X1oPgvApdtad/1JbAXJH3yPXbR+QkEwT/50cr4mqbA=";
 
     /** Cached decoded public key — loaded once on first use. */
     private volatile PublicKey mCachedPublicKey;
