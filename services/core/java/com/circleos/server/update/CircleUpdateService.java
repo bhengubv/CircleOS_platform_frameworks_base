@@ -66,6 +66,8 @@ public class CircleUpdateService extends SystemService {
     private RemoteCommandProcessor    mCommandProcessor;
     private MaintenanceWindowChecker  mMaintenanceChecker;
     private BootVerifier              mBootVerifier;
+    private DeviceEnrollment          mDeviceEnrollment;
+    private CrashReporter             mCrashReporter;
     private UpdateDownloader          mDownloader;
     private MeshOtaDownloader        mMeshDownloader;
     private UpdateInstaller           mInstaller;
@@ -118,6 +120,8 @@ public class CircleUpdateService extends SystemService {
                 });
         mMaintenanceChecker = new MaintenanceWindowChecker();
         mBootVerifier       = new BootVerifier(getContext());
+        mDeviceEnrollment   = new DeviceEnrollment();
+        mCrashReporter      = new CrashReporter();
         mDownloader     = new UpdateDownloader(getContext());
         mMeshDownloader = new MeshOtaDownloader(getContext());
         mInstaller      = new UpdateInstaller(getContext());
@@ -170,6 +174,11 @@ public class CircleUpdateService extends SystemService {
                 ? mChannelOverride
                 : SystemProperties.get("ro.circleos.channel", "stable");
         mHandler.post(() -> mBootVerifier.verifyAndReport(bootChannel));
+
+        // Phase 9: install crash/ANR reporter (synchronous, installs handler on calling thread)
+        mCrashReporter.install(bootChannel);
+        // Phase 9: enrol / refresh device in fleet registry (network call — run in background)
+        mHandler.post(() -> mDeviceEnrollment.enrol(bootChannel));
 
         // Trigger first check after a short delay to not burden early boot
         mHandler.postDelayed(this::runCheck, FIRST_CHECK_DELAY_MS);
