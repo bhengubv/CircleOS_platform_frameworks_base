@@ -64,6 +64,8 @@ public class CircleUpdateService extends SystemService {
     private OtaPolicyManager          mPolicyManager;
     private UpdateTelemetry           mTelemetry;
     private RemoteCommandProcessor    mCommandProcessor;
+    private MaintenanceWindowChecker  mMaintenanceChecker;
+    private BootVerifier              mBootVerifier;
     private UpdateDownloader          mDownloader;
     private MeshOtaDownloader        mMeshDownloader;
     private UpdateInstaller           mInstaller;
@@ -114,6 +116,8 @@ public class CircleUpdateService extends SystemService {
                         mBinder.setChannel(newChannel);
                     }
                 });
+        mMaintenanceChecker = new MaintenanceWindowChecker();
+        mBootVerifier       = new BootVerifier(getContext());
         mDownloader     = new UpdateDownloader(getContext());
         mMeshDownloader = new MeshOtaDownloader(getContext());
         mInstaller      = new UpdateInstaller(getContext());
@@ -161,6 +165,12 @@ public class CircleUpdateService extends SystemService {
         // Schedule the 12-hour repeating alarm
         UpdateScheduler.schedule(getContext());
 
+        // Phase 8: run boot verification in background (non-blocking)
+        final String bootChannel = (mChannelOverride != null)
+                ? mChannelOverride
+                : SystemProperties.get("ro.circleos.channel", "stable");
+        mHandler.post(() -> mBootVerifier.verifyAndReport(bootChannel));
+
         // Trigger first check after a short delay to not burden early boot
         mHandler.postDelayed(this::runCheck, FIRST_CHECK_DELAY_MS);
     }
@@ -205,6 +215,9 @@ public class CircleUpdateService extends SystemService {
 
         // Phase 7: process any pending remote commands before the update check
         mCommandProcessor.processPendingCommands(channel);
+
+        // Phase 8: refresh maintenance window
+        mMaintenanceChecker.refresh(channel);
 
         // Apply current channel override to checker
         mChecker.setChannelOverride(mChannelOverride);
@@ -365,6 +378,13 @@ public class CircleUpdateService extends SystemService {
             Log.e(TAG, "applyUpdate() called but no downloaded file found");
             setState(UpdateState.FAILED);
             mNotifManager.showFailed("Update file not found");
+            return;
+        }
+
+        // Phase 8: enforce maintenance window
+        if (!mMaintenanceChecker.isInstallAllowed()) {
+            Log.i(TAG, "Outside maintenance window — deferring install");
+            mNotifManager.showReadyToInstall(mAvailableVersion); // keep notification visible
             return;
         }
 
