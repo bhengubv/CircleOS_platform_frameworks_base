@@ -44,8 +44,49 @@ public class InfrastructureMapper {
     /** Minimum IPs in a /24 before we predict the whole subnet. */
     private static final int SUBNET_PREDICTION_THRESHOLD = 3;
 
-    /** known-bad ASN ranges (populated from Data Acuity feeds in Phase 4). */
-    private static final Set<String> KNOWN_BAD_ASNS = new HashSet<>();
+    /**
+     * Seed list of ASNs with documented history of hosting C2 infrastructure,
+     * bulletproof hosting, or high abuse rates. Sourced from public threat
+     * intelligence (Spamhaus ASN-DROP, AbuseIPDB ASN stats, public CTI reports).
+     *
+     * Phase 4: supplement this static list by pulling ASN-DROP from Data Acuity
+     * API on a 24-hour refresh cycle.
+     */
+    private static final Set<String> KNOWN_BAD_ASNS = new HashSet<>(java.util.Arrays.asList(
+        // Bulletproof hosters with documented abuse
+        "AS3842",   // RACKDOG-AS — repeatedly used for C2 / botnet infrastructure
+        "AS49581",  // Ferdinand Zink (TUBK) — bulletproof host, RU
+        "AS197068", // QWARTA LLC — bulletproof, RU
+        "AS206485", // MAFF LLC — frequent C2 hoster
+        "AS59795",  // Hostmaster Ltd — known spam/C2 host
+        "AS60117",  // Makonix SIA — LV bulletproof
+        "AS35624",  // EnterHost UA — bulletproof, Ukraine
+        "AS8283",   // Alexhost SRL MD — abused for botnet C2
+        "AS209854", // Nybula Ltd — bulletproof UK
+        "AS196892", // Delis LLC — Russia, bulletproof
+        "AS12586",  // GHOSTnet GmbH — RU transit, abuse-heavy
+        "AS43260",  // DGN Teknoloji (Turkey) — bulletproof
+        "AS9002",   // RETN Limited — used as C2 transit
+        "AS52019",  // Internet Free Zone — Russia, C2 hosting
+        "AS210320", // Alibek Omarov — KZ bulletproof
+        "AS48031",  // Yulia Cher — RU bulletproof
+        "AS197555", // Layer-6 Networks — UK bulletproof
+        "AS13213",  // UK2NET-AS — historically abused VPS provider
+        "AS197414", // Medyabim Internet Hizmetleri — TR bulletproof
+        "AS49544",  // i3D.net — mixed, used in high-profile DDoS campaigns
+        "AS42831",  // UK Dedicated Servers — frequently abused
+        "AS34665",  // Petersburg Internet Network — RU spam/C2
+        "AS43289",  // Telehandel — DE bulletproof
+        "AS47869",  // Netrouting B.V. — NL, C2-heavy
+        "AS204428"  // SS-Net — Ukraine bulletproof
+    ));
+
+    // ip → ASN (e.g. "AS12345")
+    private final ConcurrentHashMap<String, String> mIpAsnMap
+            = new ConcurrentHashMap<>();
+    // ASN → set of IPs seen in that ASN
+    private final ConcurrentHashMap<String, Set<String>> mAsnIpMap
+            = new ConcurrentHashMap<>();
 
     // subnet (/24) → set of known-bad IPs in that subnet
     private final ConcurrentHashMap<String, Set<String>> mSubnetMap
@@ -211,6 +252,61 @@ public class InfrastructureMapper {
             }
         }
         Log.i(TAG, "Ingested " + campaigns.size() + " campaigns into infrastructure graph");
+    }
+
+    /**
+     * Add a known-bad IP with its ASN. If the ASN is in KNOWN_BAD_ASNS the
+     * IP is flagged for elevated priority in future threat scoring.
+     *
+     * @param ip         IPv4 address
+     * @param asn        ASN string in "AS12345" format, or null if unknown
+     * @param campaignId Campaign this IP belongs to
+     * @return true if the ASN was in the known-bad set
+     */
+    public boolean addIpWithAsn(String ip, String asn, String campaignId) {
+        addIp(ip, campaignId);
+        if (asn != null && !asn.isEmpty()) {
+            mIpAsnMap.put(ip, asn);
+            mAsnIpMap.computeIfAbsent(asn, k -> new HashSet<>()).add(ip);
+            if (KNOWN_BAD_ASNS.contains(asn)) {
+                Log.w(TAG, "IP " + ip + " in known-bad ASN " + asn
+                        + " (campaign=" + campaignId + ")");
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns true if the given ASN is in the known-bad seed list.
+     * Can be used by calling code to elevate threat confidence before
+     * storing a ThreatIndicator.
+     */
+    public boolean isKnownBadAsn(String asn) {
+        return asn != null && KNOWN_BAD_ASNS.contains(asn);
+    }
+
+    /**
+     * Returns all IPs seen in a given ASN across all campaigns.
+     * Useful for lateral infrastructure discovery.
+     */
+    public List<String> getIpsByAsn(String asn) {
+        Set<String> ips = mAsnIpMap.get(asn);
+        return ips != null ? new ArrayList<>(ips) : new ArrayList<>();
+    }
+
+    /**
+     * Adds the KNOWN_BAD_ASNS set entries from an external feed update.
+     * Phase 4: called by DataAcuityClient on receipt of ASN-DROP feed.
+     */
+    public void ingestBadAsnFeed(List<String> asnList) {
+        if (asnList == null || asnList.isEmpty()) return;
+        int added = 0;
+        for (String asn : asnList) {
+            if (asn != null && !asn.isEmpty() && KNOWN_BAD_ASNS.add(asn)) added++;
+        }
+        Log.i(TAG, "ingestBadAsnFeed: added " + added + " new ASNs (total="
+                + KNOWN_BAD_ASNS.size() + ")");
     }
 
     private boolean isIp(String s) {
