@@ -9,8 +9,10 @@ import android.util.Log;
 
 import com.android.server.SystemService;
 
+import za.co.circleos.security.AttackCampaign;
 import za.co.circleos.security.DmzAnalysisResult;
 import za.co.circleos.security.QuarantineRecord;
+import za.co.circleos.security.ThreatIndicator;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -49,6 +51,7 @@ public class CommunityDefenseService extends SystemService {
     private static final long   SUBMIT_INTERVAL_MS = 6 * 60 * 60 * 1000L; // 6 hours
 
     private final LinkedBlockingQueue<AnonymizedIoc> mQueue = new LinkedBlockingQueue<>();
+    private final CampaignCorrelator mCampaignCorrelator = new CampaignCorrelator();
     private DataAcuityClient mDataAcuityClient;
     private boolean mEnabled = false;
 
@@ -111,37 +114,72 @@ public class CommunityDefenseService extends SystemService {
 
     /** Submit IOCs from a DMZ analysis result. No-op if user not opted in. */
     public void submitFromDmzResult(DmzAnalysisResult result) {
-        if (!mEnabled) return;
+        long now = System.currentTimeMillis();
+        int conf = confidenceForVerdict(result.verdict);
 
-        // Hash IOC
+        List<ThreatIndicator> indicators = new ArrayList<>();
+
         if (result.sha256 != null && !result.sha256.isEmpty()) {
-            enqueue(new AnonymizedIoc(AnonymizedIoc.Type.HASH, result.sha256,
-                    result.verdict, confidenceForVerdict(result.verdict)));
+            if (mEnabled) enqueue(new AnonymizedIoc(
+                    AnonymizedIoc.Type.HASH, result.sha256, result.verdict, conf));
+            indicators.add(makeTi(ThreatIndicator.TYPE_FILE_HASH,
+                    result.sha256, conf, "dmz", now));
         }
-        // C2 address IOCs
         for (String addr : result.c2Addresses) {
             boolean isIp = addr.matches("\\d{1,3}(\\.\\d{1,3}){3}(:\\d+)?");
-            enqueue(new AnonymizedIoc(
+            if (mEnabled) enqueue(new AnonymizedIoc(
                     isIp ? AnonymizedIoc.Type.IP : AnonymizedIoc.Type.DOMAIN,
-                    addr, result.verdict, confidenceForVerdict(result.verdict)));
+                    addr, result.verdict, conf));
+            indicators.add(makeTi(
+                    isIp ? ThreatIndicator.TYPE_IP_ADDRESS : ThreatIndicator.TYPE_DOMAIN,
+                    addr, conf, "dmz", now));
         }
+        if (!indicators.isEmpty()) mCampaignCorrelator.correlate(indicators);
     }
 
     /** Submit IOCs from a quarantine record. */
     public void submitFromQuarantine(QuarantineRecord record) {
-        if (!mEnabled) return;
+        long now = System.currentTimeMillis();
+        List<ThreatIndicator> indicators = new ArrayList<>();
+
         if (record.sha256 != null) {
-            enqueue(new AnonymizedIoc(AnonymizedIoc.Type.HASH, record.sha256,
-                    DmzAnalysisResult.VERDICT_THREAT, 3));
+            if (mEnabled) enqueue(new AnonymizedIoc(
+                    AnonymizedIoc.Type.HASH, record.sha256, DmzAnalysisResult.VERDICT_THREAT, 3));
+            indicators.add(makeTi(ThreatIndicator.TYPE_FILE_HASH, record.sha256, 3, "quarantine", now));
         }
         for (String ioc : record.iocExtracted) {
             boolean isIp = ioc.matches("\\d{1,3}(\\.\\d{1,3}){3}.*");
             if (!ioc.startsWith("BEHAVIORAL:") && !ioc.startsWith("CDR:")) {
-                enqueue(new AnonymizedIoc(
+                if (mEnabled) enqueue(new AnonymizedIoc(
                         isIp ? AnonymizedIoc.Type.IP : AnonymizedIoc.Type.DOMAIN,
                         ioc, DmzAnalysisResult.VERDICT_THREAT, 2));
+                indicators.add(makeTi(
+                        isIp ? ThreatIndicator.TYPE_IP_ADDRESS : ThreatIndicator.TYPE_DOMAIN,
+                        ioc, 2, "quarantine", now));
             }
         }
+        if (!indicators.isEmpty()) mCampaignCorrelator.correlate(indicators);
+    }
+
+    /**
+     * Ingest ThreatIndicators shared by a mesh peer.
+     * Runs correlation regardless of community-defense opt-in (local correlation only).
+     */
+    public void receivePeerThreatIndicators(List<ThreatIndicator> indicators) {
+        if (indicators == null || indicators.isEmpty()) return;
+        List<String> touched = mCampaignCorrelator.correlate(indicators);
+        Log.i(TAG, "Peer IOCs received: " + indicators.size()
+                + " → " + touched.size() + " campaign(s) affected");
+    }
+
+    /** Returns all correlated attack campaigns seen on this device. */
+    public List<AttackCampaign> getActiveCampaigns() {
+        return mCampaignCorrelator.getAllCampaigns();
+    }
+
+    /** Returns a specific campaign by ID, or null. */
+    public AttackCampaign getCampaign(String campaignId) {
+        return mCampaignCorrelator.getCampaign(campaignId);
     }
 
     /** Called by user to toggle opt-in. */
@@ -196,5 +234,17 @@ public class CommunityDefenseService extends SystemService {
             case DmzAnalysisResult.VERDICT_SUSPICIOUS: return 2;
             default: return 1;
         }
+    }
+
+    private static ThreatIndicator makeTi(int type, String value, int confidence,
+                                          String source, long now) {
+        ThreatIndicator ti = new ThreatIndicator();
+        ti.type       = type;
+        ti.value      = value;
+        ti.confidence = confidence;
+        ti.source     = source;
+        ti.firstSeen  = now;
+        ti.lastSeen   = now;
+        return ti;
     }
 }
