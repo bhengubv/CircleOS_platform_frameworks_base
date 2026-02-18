@@ -61,11 +61,16 @@ public class CircleUpdateService extends SystemService {
 
     private UpdateChecker             mChecker;
     private DeltaChecker              mDeltaChecker;
+    private OtaPolicyManager          mPolicyManager;
+    private UpdateTelemetry           mTelemetry;
     private UpdateDownloader          mDownloader;
     private MeshOtaDownloader        mMeshDownloader;
     private UpdateInstaller           mInstaller;
     private UpdateNotificationManager mNotifManager;
     private UpdateScheduler.UpdateCheckReceiver mCheckReceiver;
+
+    /** Last policy result; may be null before first successful policy fetch. */
+    private volatile OtaPolicyManager.PolicyResult mLastPolicy;
 
     private volatile int    mState           = UpdateState.IDLE;
     private volatile String mAvailableVersion;
@@ -97,6 +102,8 @@ public class CircleUpdateService extends SystemService {
 
         mChecker        = new UpdateChecker(getContext());
         mDeltaChecker   = new DeltaChecker();
+        mPolicyManager  = new OtaPolicyManager();
+        mTelemetry      = new UpdateTelemetry();
         mDownloader     = new UpdateDownloader(getContext());
         mMeshDownloader = new MeshOtaDownloader(getContext());
         mInstaller      = new UpdateInstaller(getContext());
@@ -175,6 +182,16 @@ public class CircleUpdateService extends SystemService {
 
         Log.i(TAG, "Running update check");
         setState(UpdateState.CHECKING);
+
+        // Report CHECKING state to telemetry
+        final String channel = (mChannelOverride != null)
+                ? mChannelOverride
+                : SystemProperties.get("ro.circleos.channel", "stable");
+        mTelemetry.report(channel, Build.VERSION.RELEASE, UpdateState.name(UpdateState.CHECKING));
+
+        // Fetch and apply central policy (min_version, force_update_by, feature flags)
+        mLastPolicy = mPolicyManager.fetchAndApply(channel);
+        Log.i(TAG, "Policy result: " + mLastPolicy);
 
         // Apply current channel override to checker
         mChecker.setChannelOverride(mChannelOverride);
@@ -293,8 +310,14 @@ public class CircleUpdateService extends SystemService {
                     Log.e(TAG, "All download strategies failed", e);
                     mDownloadProgress = -1;
                     setState(UpdateState.FAILED);
-                    mNotifManager.showFailed(e.getMessage() != null
-                            ? e.getMessage() : "Download error");
+                    String errMsg = e.getMessage() != null ? e.getMessage() : "Download error";
+                    mNotifManager.showFailed(errMsg);
+                    // Report failure with error detail
+                    final String failChannel = (mChannelOverride != null)
+                            ? mChannelOverride
+                            : SystemProperties.get("ro.circleos.channel", "stable");
+                    mTelemetry.report(failChannel, Build.VERSION.RELEASE,
+                            UpdateState.name(UpdateState.FAILED), errMsg);
                     return;
                 }
             }
@@ -356,6 +379,13 @@ public class CircleUpdateService extends SystemService {
     private void setState(int newState) {
         Log.d(TAG, "State: " + UpdateState.name(mState) + " -> " + UpdateState.name(newState));
         mState = newState;
+        // Report state change to telemetry (best-effort, no error propagation)
+        if (mTelemetry != null) {
+            final String ch = (mChannelOverride != null)
+                    ? mChannelOverride
+                    : SystemProperties.get("ro.circleos.channel", "stable");
+            mTelemetry.report(ch, Build.VERSION.RELEASE, UpdateState.name(newState));
+        }
     }
 
     // ── Preferences ───────────────────────────────────────────────────────────
