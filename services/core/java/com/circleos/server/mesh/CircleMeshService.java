@@ -19,7 +19,10 @@ import com.android.server.SystemService;
 
 import za.co.circleos.mesh.ICircleMeshService;
 
+import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.util.ArrayList;
+import java.util.Enumeration;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -247,6 +250,14 @@ public final class CircleMeshService extends SystemService {
         if (mBatteryPct >= BATT_SUSPEND_MIN) {
             mWifiTransport.start();
             mMdnsTransport.start();
+            // Tell BLE GATT server our local WiFi-Direct TCP address
+            // so scanning peers can read it via the WiFi-IP characteristic.
+            mHandler.postDelayed(() -> {
+                String localIp = detectLocalWifiIp();
+                if (localIp != null) {
+                    mBleTransport.setLocalWifiEndpoint(localIp, WifiDirectTransport.MESH_PORT);
+                }
+            }, 2_000); // wait 2 s for TCP server to bind
         }
         mBleTransport.start(); // BLE advertising is low-power; always start
 
@@ -392,6 +403,38 @@ public final class CircleMeshService extends SystemService {
         } catch (Exception e) {
             Log.w(TAG, "broadcastTextMessage failed", e);
         }
+    }
+
+    // ── Local WiFi IP detection ───────────────────────────────────────────────
+
+    /**
+     * Finds the local IPv4 address suitable for WiFi Direct or LAN TCP mesh.
+     * Prefers the WiFi Direct group-owner subnet (192.168.49.x), then any
+     * non-loopback IPv4 address.
+     *
+     * @return IP address string, or null if none found.
+     */
+    private static String detectLocalWifiIp() {
+        String fallback = null;
+        try {
+            Enumeration<NetworkInterface> ifaces = NetworkInterface.getNetworkInterfaces();
+            while (ifaces.hasMoreElements()) {
+                NetworkInterface iface = ifaces.nextElement();
+                if (!iface.isUp() || iface.isLoopback()) continue;
+                Enumeration<InetAddress> addrs = iface.getInetAddresses();
+                while (addrs.hasMoreElements()) {
+                    InetAddress addr = addrs.nextElement();
+                    if (addr.isLoopbackAddress()) continue;
+                    String ip = addr.getHostAddress();
+                    if (ip == null || ip.contains(":")) continue; // skip IPv6
+                    if (ip.startsWith("192.168.49.")) return ip;  // WiFi Direct preferred
+                    if (fallback == null) fallback = ip;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "detectLocalWifiIp failed", e);
+        }
+        return fallback;
     }
 
     // ── Store-and-forward flush ───────────────────────────────────────────────
