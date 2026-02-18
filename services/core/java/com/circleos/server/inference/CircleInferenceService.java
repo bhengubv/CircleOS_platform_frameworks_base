@@ -26,7 +26,10 @@ import za.co.circleos.inference.ResourceMetrics;
 import za.co.circleos.inference.Token;
 
 import java.io.File;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
 
 /**
@@ -88,8 +91,14 @@ public class CircleInferenceService extends SystemService {
     @Override
     public void onBootPhase(int phase) {
         if (phase == SystemService.PHASE_BOOT_COMPLETED) {
-            Log.i(TAG, "Boot completed — loading optimal model");
+            Log.i(TAG, "Boot completed — loading optimal model and refreshing remote manifest");
             mHandler.post(this::loadOptimalModelAsync);
+            // Fetch remote model store manifest in background after boot
+            mHandler.post(() -> {
+                String url = android.os.SystemProperties.get(
+                        "circleos.inference.model_store_url", MODEL_STORE_MANIFEST_URL);
+                mModelManager.refreshRemoteManifest(url);
+            });
         }
     }
 
@@ -249,9 +258,14 @@ public class CircleInferenceService extends SystemService {
         // ── Model store (Phase 4) ─────────────────────────────────────────────
 
         @Override public List<ModelInfo> getDownloadableModels() {
-            // Phase 4: returns locally-discovered models for now.
-            // Phase 5: fetches remote manifest from MODEL_STORE_MANIFEST_URL.
-            return mModelManager.listAvailableModels();
+            // Merge local (bundled + downloaded) with cached remote manifest.
+            // Local entries take precedence so isDownloaded stays accurate.
+            Map<String, ModelInfo> seen = new LinkedHashMap<>();
+            for (ModelInfo m : mModelManager.listAvailableModels()) seen.put(m.id, m);
+            for (ModelInfo m : mModelManager.getCachedRemoteModels()) {
+                if (!seen.containsKey(m.id)) seen.put(m.id, m);
+            }
+            return new ArrayList<>(seen.values());
         }
 
         @Override public void downloadModel(String modelId, IInferenceCallback callback) {

@@ -25,7 +25,9 @@ import java.net.URL;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Manages model discovery, integrity verification, and downloads (Phase 2).
@@ -153,14 +155,114 @@ public class ModelManager {
         }
     }
 
-    // ── Download (Phase 2) ────────────────────────────────────────────────────
+    // ── Remote manifest (Phase 4) ─────────────────────────────────────────────
 
     /**
-     * Downloads a model from its manifest downloadUrl to /data/circle/models/.
-     * Call from a background thread. Reports progress via callback.
+     * Fetches the remote model store manifest and returns the list of available
+     * models. Merges with locally-installed models: remote entries with a
+     * matching model_id inherit isDownloaded = true if the file is present.
+     *
+     * Expected JSON shape (from SleptOnAPI GET /inference/models):
+     * { "models": [{ "modelId", "name", "filename", "quantization",
+     *                "sizeBytes", "sha256", "cdnUrl", "minRamMb",
+     *                "parameterCount", "recommendedTier", "backend" }] }
+     *
+     * @param manifestUrl  Full URL to the manifest endpoint
+     * @return list of remote ModelInfo objects, empty on network/parse failure
+     */
+    public List<ModelInfo> fetchRemoteManifest(String manifestUrl) {
+        List<ModelInfo> result = new ArrayList<>();
+        HttpURLConnection conn = null;
+        try {
+            conn = (HttpURLConnection) new URL(manifestUrl).openConnection();
+            conn.setConnectTimeout(15_000);
+            conn.setReadTimeout(20_000);
+            conn.setRequestProperty("Accept", "application/json");
+            conn.connect();
+            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                Log.w(TAG, "Remote manifest returned HTTP " + conn.getResponseCode());
+                return result;
+            }
+            StringBuilder sb = new StringBuilder();
+            try (java.io.InputStream is = new BufferedInputStream(conn.getInputStream());
+                 java.io.InputStreamReader isr = new java.io.InputStreamReader(is);
+                 BufferedReader br = new BufferedReader(isr)) {
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+            }
+            JSONArray arr = new JSONObject(sb.toString()).getJSONArray("models");
+            File downloadDir = new File(DOWNLOAD_DIR);
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.getJSONObject(i);
+                ModelInfo m = new ModelInfo();
+                m.id              = o.optString("modelId", "unknown");
+                m.name            = o.optString("name", m.id);
+                m.sizeBytes       = o.optLong("sizeBytes", 0);
+                m.minRamMb        = o.optInt("minRamMb", 0);
+                m.recommendedTier = o.optInt("recommendedTier", 1);
+                m.backend         = o.optString("backend", "llama.cpp");
+                m.isBundled       = false;
+                String fn         = o.optString("filename", "");
+                m.isDownloaded    = !fn.isEmpty() && new File(downloadDir, fn).exists();
+                result.add(m);
+                // Stash CDN URL + SHA256 for use by downloadModel()
+                String cdnUrl = o.optString("cdnUrl", "");
+                if (!cdnUrl.isEmpty()) _remoteCdnUrls.put(m.id, cdnUrl);
+                String sha256 = o.optString("sha256", "");
+                if (!sha256.isEmpty()) _remoteSha256s.put(m.id, sha256);
+            }
+            Log.i(TAG, "Remote manifest: " + result.size() + " model(s) from " + manifestUrl);
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to fetch remote manifest: " + e.getMessage());
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+        return result;
+    }
+
+    /**
+     * Refreshes the in-memory remote manifest cache. Should be called once after
+     * boot from a background thread. Subsequent listRemoteModels() calls are fast.
+     */
+    public synchronized void refreshRemoteManifest(String manifestUrl) {
+        try {
+            List<ModelInfo> remote = fetchRemoteManifest(manifestUrl);
+            if (!remote.isEmpty()) {
+                _remoteManifestUrl  = manifestUrl;
+                _remoteModels       = remote;
+                _remoteRefreshedAt  = System.currentTimeMillis();
+                Log.i(TAG, "Remote manifest cached: " + remote.size() + " model(s)");
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "refreshRemoteManifest failed", e);
+        }
+    }
+
+    /** Returns the last cached remote model list, or empty if never fetched. */
+    public synchronized List<ModelInfo> getCachedRemoteModels() {
+        return _remoteModels != null ? _remoteModels : new ArrayList<>();
+    }
+
+    // Remote manifest cache — populated by refreshRemoteManifest()
+    private volatile String          _remoteManifestUrl;
+    private volatile List<ModelInfo> _remoteModels;
+    private volatile long            _remoteRefreshedAt;
+    // Per-model CDN URL and SHA256 from last successful remote fetch
+    private final Map<String, String> _remoteCdnUrls  = new HashMap<>();
+    private final Map<String, String> _remoteSha256s  = new HashMap<>();
+
+    // ── Download (Phase 2 / Phase 4) ──────────────────────────────────────────
+
+    /**
+     * Downloads a model to /data/circle/models/.
+     * Prefers a cached remote CDN URL if the model was found via fetchRemoteManifest;
+     * falls back to the local manifest downloadUrl field.
+     * Call from a background thread.
      */
     public void downloadModel(String modelId, DownloadCallback cb) {
-        String url = getDownloadUrl(modelId);
+        // Prefer remote CDN URL; fall back to local manifest downloadUrl
+        String url = _remoteCdnUrls.get(modelId);
+        if (url == null) url = getDownloadUrl(modelId);
         if (url == null) {
             String msg = "No downloadUrl for: " + modelId;
             Log.e(TAG, msg);
@@ -191,6 +293,17 @@ public class ModelManager {
                     received += n;
                     if (cb != null) cb.onProgress(modelId, received, total);
                 }
+            }
+            // Verify SHA256 from remote manifest (or local manifest fallback)
+            String expectedSha = _remoteSha256s.containsKey(modelId)
+                    ? _remoteSha256s.get(modelId)
+                    : getExpectedChecksum(modelId);
+            if (expectedSha != null && !verifyIntegrity(dest, expectedSha)) {
+                dest.delete();
+                String msg = "Integrity check failed after download: " + modelId;
+                Log.e(TAG, msg);
+                if (cb != null) cb.onError(modelId, msg);
+                return;
             }
             Log.i(TAG, "Download complete: " + dest);
             if (cb != null) cb.onComplete(modelId);
