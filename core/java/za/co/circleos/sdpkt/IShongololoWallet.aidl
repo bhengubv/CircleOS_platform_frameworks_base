@@ -192,6 +192,24 @@ interface IShongololoWallet {
     /** Unlink a device by its deviceId. */
     boolean unlinkDevice(String deviceId);
 
+    /* ── Phase 6: Wearable link ──────────────────────── */
+
+    /**
+     * Returns true if a Wear OS companion sent health data within the last 30 seconds.
+     */
+    boolean isWearableConnected();
+
+    /**
+     * Returns the most recent heart rate in BPM from the wearable, or -1 if unknown.
+     */
+    int getWearableHeartRate();
+
+    /**
+     * Returns the most recent galvanic skin response score (0-100) from the wearable,
+     * or -1 if no data has been received yet.
+     */
+    int getWearableGsrScore();
+
     /* ── Service info ────────────────────────────────── */
 
     int getServiceVersion();

@@ -469,6 +469,23 @@ public class SdpktTitaniumService extends SystemService {
             return mProtectionEngine.getProtectionEvents(limit > 0 ? limit : 20);
         }
 
+        /* ── Phase 5/6: Wearable link ────────────── */
+
+        @Override
+        public boolean isWearableConnected() {
+            return mWearLinkManager != null && mWearLinkManager.isWearableConnected();
+        }
+
+        @Override
+        public int getWearableHeartRate() {
+            return mWearLinkManager != null ? mWearLinkManager.getWearableHeartRate() : -1;
+        }
+
+        @Override
+        public int getWearableGsrScore() {
+            return mWearLinkManager != null ? mWearLinkManager.getWearableGsrScore() : -1;
+        }
+
         /* ── Phase 5: Analytics ──────────────────── */
 
         @Override
