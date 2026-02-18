@@ -63,6 +63,7 @@ public class CircleUpdateService extends SystemService {
     private DeltaChecker              mDeltaChecker;
     private OtaPolicyManager          mPolicyManager;
     private UpdateTelemetry           mTelemetry;
+    private RemoteCommandProcessor    mCommandProcessor;
     private UpdateDownloader          mDownloader;
     private MeshOtaDownloader        mMeshDownloader;
     private UpdateInstaller           mInstaller;
@@ -104,6 +105,15 @@ public class CircleUpdateService extends SystemService {
         mDeltaChecker   = new DeltaChecker();
         mPolicyManager  = new OtaPolicyManager();
         mTelemetry      = new UpdateTelemetry();
+        mCommandProcessor = new RemoteCommandProcessor(getContext(),
+                new RemoteCommandProcessor.CommandCallback() {
+                    @Override public void onForceUpdate() {
+                        mHandler.post(CircleUpdateService.this::runCheck);
+                    }
+                    @Override public void onChangeChannel(String newChannel) {
+                        mBinder.setChannel(newChannel);
+                    }
+                });
         mDownloader     = new UpdateDownloader(getContext());
         mMeshDownloader = new MeshOtaDownloader(getContext());
         mInstaller      = new UpdateInstaller(getContext());
@@ -192,6 +202,9 @@ public class CircleUpdateService extends SystemService {
         // Fetch and apply central policy (min_version, force_update_by, feature flags)
         mLastPolicy = mPolicyManager.fetchAndApply(channel);
         Log.i(TAG, "Policy result: " + mLastPolicy);
+
+        // Phase 7: process any pending remote commands before the update check
+        mCommandProcessor.processPendingCommands(channel);
 
         // Apply current channel override to checker
         mChecker.setChannelOverride(mChannelOverride);
