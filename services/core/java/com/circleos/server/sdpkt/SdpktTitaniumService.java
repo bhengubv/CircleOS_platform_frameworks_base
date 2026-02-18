@@ -10,15 +10,21 @@ import android.util.Log;
 
 import com.android.server.SystemService;
 
+import za.co.circleos.sdpkt.AnalyticsSummary;
+import za.co.circleos.sdpkt.CalibrationState;
+import za.co.circleos.sdpkt.DeviceLink;
 import za.co.circleos.sdpkt.IShongololoWallet;
 import za.co.circleos.sdpkt.LocationContext;
 import za.co.circleos.sdpkt.NfcTransferRequest;
+import za.co.circleos.sdpkt.ProtectionEvent;
 import za.co.circleos.sdpkt.ShongololoTransaction;
 import za.co.circleos.sdpkt.SyncStatus;
 import za.co.circleos.sdpkt.TransactionResult;
 import za.co.circleos.sdpkt.WalletBalance;
 import za.co.circleos.sdpkt.WalletKey;
 
+import java.io.File;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -52,7 +58,7 @@ public class SdpktTitaniumService extends SystemService {
 
     private static final String TAG          = "SdpktTitanium";
     public  static final String SERVICE_NAME = "circle.sdpkt";
-    public  static final int    VERSION      = 4;
+    public  static final int    VERSION      = 5;
 
     private final BinderService  mBinderService = new BinderService();
 
@@ -78,6 +84,12 @@ public class SdpktTitaniumService extends SystemService {
 
     /* ── Phase 4 components ──────────────────────────────── */
     private PersonalityModeAdapter mPersonalityAdapter;
+
+    /* ── Phase 5 components ──────────────────────────────── */
+    private CalibrationManager     mCalibration;
+    private ProtectionLog          mProtectionLog;
+    private WearLinkManager        mWearLinkManager;
+    private File                   mDataDir;
 
     /* ── Lifecycle ────────────────────────────────────────── */
 
@@ -149,6 +161,15 @@ public class SdpktTitaniumService extends SystemService {
             mPersonalityAdapter = new PersonalityModeAdapter();
             mPersonalityAdapter.start();
             mProtectionEngine.setPersonalityModeAdapter(mPersonalityAdapter);
+
+            // Phase 5 — Calibration, protection log, wear link
+            mDataDir        = getContext().getDir("sdpkt", Context.MODE_PRIVATE);
+            mCalibration    = new CalibrationManager(mDataDir);
+            mProtectionLog  = new ProtectionLog(mDataDir);
+            mStressDetector.setCalibrationManager(mCalibration);
+            mProtectionEngine.setPhase5Components(mProtectionLog, mCalibration);
+            mWearLinkManager = new WearLinkManager(getContext(), mStressDetector);
+            mWearLinkManager.start();
 
             // Auto-initialize wallet if this is a fresh device
             if (!mKeyManager.hasKey()) {
@@ -408,6 +429,98 @@ public class SdpktTitaniumService extends SystemService {
         @Override
         public int getPendingCount() {
             return mSettlementQueue != null ? mSettlementQueue.getPendingCount() : 0;
+        }
+
+        /* ── Phase 5: Calibration ────────────────── */
+
+        @Override
+        public CalibrationState getCalibrationState() {
+            if (mProtectionEngine == null) {
+                CalibrationState s = new CalibrationState();
+                s.state = CalibrationState.STATE_CALIBRATED;
+                return s;
+            }
+            return mProtectionEngine.getCalibrationState();
+        }
+
+        @Override
+        public void reportFalsePositive() {
+            if (mProtectionEngine != null) mProtectionEngine.reportFalsePositive();
+        }
+
+        @Override
+        public void startRecalibration() {
+            if (mCalibration != null) mCalibration.startRecalibration();
+        }
+
+        /* ── Phase 5: Protection log ─────────────── */
+
+        @Override
+        public List<ProtectionEvent> getProtectionEvents(int limit) {
+            if (mProtectionEngine == null) return new ArrayList<>();
+            return mProtectionEngine.getProtectionEvents(limit > 0 ? limit : 20);
+        }
+
+        /* ── Phase 5: Analytics ──────────────────── */
+
+        @Override
+        public AnalyticsSummary getAnalyticsSummary() {
+            List<ShongololoTransaction> all = mWalletStore != null
+                    ? mWalletStore.getTransactions(0, 0) : new ArrayList<>();
+            int blockedCount = mProtectionLog != null
+                    ? mProtectionLog.countByType(ProtectionEvent.TYPE_STRESS_BLOCK)
+                        + mProtectionLog.countByType(ProtectionEvent.TYPE_LOCATION_BLOCK)
+                        + mProtectionLog.countByType(ProtectionEvent.TYPE_LIMIT_BLOCK)
+                    : 0;
+            return WalletAnalytics.compute(all, blockedCount);
+        }
+
+        /* ── Phase 5: Export ─────────────────────── */
+
+        @Override
+        public String exportTransactions(String format) {
+            if (mWalletStore == null) return null;
+            List<ShongololoTransaction> all = mWalletStore.getTransactions(0, 0);
+            File downloads = android.os.Environment.getExternalStoragePublicDirectory(
+                    android.os.Environment.DIRECTORY_DOWNLOADS);
+            File out = "json".equalsIgnoreCase(format)
+                    ? ExportManager.exportJson(all, downloads)
+                    : ExportManager.exportCsv(all, downloads);
+            return out != null ? out.getAbsolutePath() : null;
+        }
+
+        /* ── Phase 5: Multi-device ───────────────── */
+
+        @Override
+        public List<DeviceLink> getLinkedDevices() {
+            // Phase 5 stub: returns only the primary device record.
+            // Full NFC tap-to-pair pairing protocol is Phase 6.
+            List<DeviceLink> links = new ArrayList<>();
+            WalletKey wk = mKeyManager != null ? mKeyManager.getOrCreateWalletKey() : null;
+            if (wk != null) {
+                DeviceLink primary = new DeviceLink();
+                primary.deviceId   = wk.deviceId;
+                primary.pubkeyHex  = wk.publicKeyHex;
+                primary.label      = "This device";
+                primary.role       = DeviceLink.ROLE_PRIMARY;
+                primary.linkedAtMs = 0;
+                primary.lastSeenMs = System.currentTimeMillis();
+                links.add(primary);
+            }
+            return links;
+        }
+
+        @Override
+        public boolean linkDevice(DeviceLink device) {
+            // Phase 5 stub — full pairing in Phase 6
+            Log.i(TAG, "linkDevice called: " + (device != null ? device.shortId() : "null"));
+            return false;
+        }
+
+        @Override
+        public boolean unlinkDevice(String deviceId) {
+            Log.i(TAG, "unlinkDevice: " + deviceId);
+            return false;
         }
 
         /* ── Service info ─────────────────────────── */

@@ -12,6 +12,10 @@ import za.co.circleos.sdpkt.NfcTransferRequest;
 import za.co.circleos.sdpkt.INfcTransferCallback;
 import za.co.circleos.sdpkt.SyncStatus;
 import za.co.circleos.sdpkt.LocationContext;
+import za.co.circleos.sdpkt.CalibrationState;
+import za.co.circleos.sdpkt.ProtectionEvent;
+import za.co.circleos.sdpkt.AnalyticsSummary;
+import za.co.circleos.sdpkt.DeviceLink;
 
 /**
  * SDPKT Titanium wallet binder interface.
@@ -136,6 +140,57 @@ interface IShongololoWallet {
 
     /** Number of outbound transactions not yet settled. */
     int getPendingCount();
+
+    /* ── Phase 5: Calibration ────────────────────────────── */
+
+    /** Current stress-detection calibration state. */
+    CalibrationState getCalibrationState();
+
+    /**
+     * User-reported false positive: protection blocked a legitimate transfer.
+     * Adjusts sensitivity thresholds via CalibrationManager.
+     */
+    void reportFalsePositive();
+
+    /** Restart the 7-day calibration learning period. */
+    void startRecalibration();
+
+    /* ── Phase 5: Protection log ─────────────────────────── */
+
+    /**
+     * Recent protection events (stress blocks, location blocks, etc.)
+     * Newest first.
+     * @param limit Max number of events to return; 0 = all.
+     */
+    List<ProtectionEvent> getProtectionEvents(int limit);
+
+    /* ── Phase 5: Analytics ──────────────────────────────── */
+
+    /** Aggregated transaction analytics summary. */
+    AnalyticsSummary getAnalyticsSummary();
+
+    /* ── Phase 5: Export ─────────────────────────────────── */
+
+    /**
+     * Export transaction history to Downloads directory.
+     * @param format "csv" or "json"
+     * @return Absolute path of the created file, or null on failure.
+     */
+    String exportTransactions(String format);
+
+    /* ── Phase 5: Multi-device ───────────────────────────── */
+
+    /** List devices linked to this wallet. */
+    List<DeviceLink> getLinkedDevices();
+
+    /**
+     * Link a new device by NFC tap-to-pair.
+     * The caller passes the DeviceLink populated from the NFC exchange.
+     */
+    boolean linkDevice(in DeviceLink device);
+
+    /** Unlink a device by its deviceId. */
+    boolean unlinkDevice(String deviceId);
 
     /* ── Service info ────────────────────────────────── */
 

@@ -19,10 +19,13 @@ import android.util.Log;
  *  1. Accelerometer tremor — TYPE_ACCELEROMETER
  *     High-frequency jitter in acceleration magnitude → tremor score.
  *     Window: last 50 samples (~2 s at 25 Hz sensor rate).
- *     Threshold: RMS deviation > 3.0 m/s² over the window.
+ *     Threshold: personalised via CalibrationManager (default 3.0 m/s² RMS).
  *
  *  2. Heart rate — TYPE_HEART_RATE (wearable/optical sensor, if available)
- *     > 120 BPM → elevated stress score.
+ *     Above resting HR + 30 BPM → elevated stress score.
+ *
+ *  3. Wear health data — fed by WearLinkManager when a paired Wear OS device
+ *     broadcasts GSR / HR data.
  *
  * Composite stress score: 0–100.
  *   accelerometer tremor: up to 60 points
@@ -38,8 +41,8 @@ public class StressDetector implements SensorEventListener {
 
     private static final String TAG              = "SdpktStress";
     private static final int    ACCEL_WINDOW     = 50;       // samples
-    private static final float  ACCEL_THRESHOLD  = 3.0f;    // m/s² RMS deviation
-    private static final float  HR_STRESS_BPM    = 120f;    // beats per minute
+    private static final float  ACCEL_THRESHOLD  = 3.0f;    // m/s² default RMS
+    private static final float  HR_STRESS_BPM    = 120f;    // default stress floor
     private static final int    STRESS_THRESHOLD = 70;      // composite 0-100
     private static final long   COOLDOWN_MS      = 5 * 60 * 1000L; // 5 minutes
 
@@ -47,14 +50,17 @@ public class StressDetector implements SensorEventListener {
 
     private final Context mContext;
     private SensorManager mSensorManager;
+    private CalibrationManager mCalibration;  // optional; set after construction (Phase 5)
 
     // Accelerometer ring buffer (magnitude values)
     private final float[] mAccelBuffer = new float[ACCEL_WINDOW];
     private int  mAccelIdx   = 0;
     private int  mAccelCount = 0;
 
-    // Heart rate (most recent reading)
+    // Heart rate (most recent reading — device sensor or Wear)
     private volatile float mHeartRateBpm = 0f;
+    // Wear GSR override (-1 = not available)
+    private volatile int   mWearGsrScore = -1;
 
     // Stress state
     private volatile boolean mProtectionActive  = false;
@@ -75,6 +81,22 @@ public class StressDetector implements SensorEventListener {
 
     public void setListener(StressListener listener) {
         mListener = listener;
+    }
+
+    /** Wire in Phase 5 CalibrationManager for personalised thresholds. */
+    public void setCalibrationManager(CalibrationManager calibration) {
+        mCalibration = calibration;
+    }
+
+    /**
+     * Feed Wear OS health data from {@link WearLinkManager}.
+     * @param gsrScore 0-100 galvanic skin response, or -1 if unavailable.
+     * @param hrBpm    Heart rate in BPM, or -1 if unavailable.
+     */
+    public void setWearData(int gsrScore, int hrBpm) {
+        if (gsrScore >= 0) mWearGsrScore = gsrScore;
+        if (hrBpm > 0)     mHeartRateBpm = hrBpm;
+        evaluateStress();
     }
 
     /* ── Lifecycle ─────────────────────────────────────────── */
@@ -121,6 +143,9 @@ public class StressDetector implements SensorEventListener {
                 break;
             case Sensor.TYPE_HEART_RATE:
                 mHeartRateBpm = event.values[0];
+                if (mCalibration != null) {
+                    mCalibration.recordHrSample((int) mHeartRateBpm);
+                }
                 evaluateStress();
                 break;
         }
@@ -146,6 +171,14 @@ public class StressDetector implements SensorEventListener {
 
     /** Compute composite stress score and update protection state. */
     private synchronized void evaluateStress() {
+        // Personalised thresholds (fall back to defaults during calibration)
+        float accelThreshold = (mCalibration != null)
+                ? mCalibration.getAccelThresholdCenti() / 100.0f
+                : ACCEL_THRESHOLD;
+        float hrStressFloor  = (mCalibration != null && !mCalibration.isLearning())
+                ? mCalibration.getHrStressFloorBpm()
+                : HR_STRESS_BPM;
+
         // ── Accelerometer tremor score (0-60) ──────────────
         int accelScore = 0;
         if (mAccelCount > 0) {
@@ -158,17 +191,30 @@ public class StressDetector implements SensorEventListener {
                 sumSq += d * d;
             }
             float rms = (float) Math.sqrt(sumSq / n);
+            if (mCalibration != null) mCalibration.recordAccelSample(rms);
             // Scale: 0 rms → 0, threshold rms → 60
-            accelScore = (int) Math.min(60f, (rms / ACCEL_THRESHOLD) * 60f);
+            accelScore = (int) Math.min(60f, (rms / accelThreshold) * 60f);
+        }
+
+        // ── Wear GSR boost (if available, blended 0-20 points into accel slot) ──
+        if (mWearGsrScore >= 0) {
+            int gsrBoost = (int) (mWearGsrScore * 0.2f); // 100% GSR → +20
+            accelScore = Math.min(60, accelScore + gsrBoost);
         }
 
         // ── Heart rate score (0-40) ─────────────────────────
         int hrScore = 0;
         if (mHeartRateBpm > 0) {
-            if (mHeartRateBpm >= HR_STRESS_BPM) {
+            if (mHeartRateBpm >= hrStressFloor) {
                 hrScore = (int) Math.min(40f,
-                        ((mHeartRateBpm - HR_STRESS_BPM) / 30f) * 40f + 20f);
+                        ((mHeartRateBpm - hrStressFloor) / 30f) * 40f + 20f);
             }
+        }
+
+        // Don't enforce stress blocks during calibration learning period
+        if (mCalibration != null && mCalibration.isLearning()) {
+            mLastStressScore = accelScore + hrScore;
+            return;  // record score but don't trigger protection
         }
 
         int total = accelScore + hrScore;

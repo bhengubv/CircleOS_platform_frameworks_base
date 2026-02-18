@@ -47,7 +47,9 @@ public class ProtectionEngine {
     private final StressDetector        mStressDetector;
     private final WalletStore           mWalletStore;
     private final Handler               mWorkerHandler;
-    private PersonalityModeAdapter      mPersonality;  // set after construction (Phase 4)
+    private PersonalityModeAdapter      mPersonality;   // Phase 4
+    private ProtectionLog               mProtectionLog; // Phase 5
+    private CalibrationManager          mCalibration;   // Phase 5
 
     private boolean mNotifChannelCreated = false;
 
@@ -89,8 +91,10 @@ public class ProtectionEngine {
 
         // ── 1. Stress check (highest priority — deceptive deny) ──────
         if (mStressDetector.isProtectionActive()) {
-            Log.w(TAG, "Transfer blocked — stress protection active (score="
-                    + mStressDetector.getStressScore() + ")");
+            int score = mStressDetector.getStressScore();
+            Log.w(TAG, "Transfer blocked — stress protection active (score=" + score + ")");
+            logEvent(ProtectionEvent.TYPE_STRESS_BLOCK, amountCents,
+                     "stress score " + score + " > " + 70, null);
             // Deceptive response: looks like a network error
             return TransactionResult.fail(
                     TransactionResult.ERR_INTERNAL, "Network error");
@@ -122,6 +126,8 @@ public class ProtectionEngine {
         if (amountCents > effectivePerTap) {
             Log.i(TAG, "Transfer blocked — limit (" + limitContext
                     + " per-tap=" + effectivePerTap + ")");
+            logEvent(ProtectionEvent.TYPE_LOCATION_BLOCK, amountCents,
+                     limitContext + " per-tap=" + formatCents(effectivePerTap), loc.locationLabel);
             return TransactionResult.fail(
                     TransactionResult.ERR_PROTECTION_LOCATION,
                     "Limit (" + limitContext + "): " + formatCents(effectivePerTap) + " per tap");
@@ -142,10 +148,14 @@ public class ProtectionEngine {
             }
             long dailyRemaining = mWalletStore.getDailyRemainingCents();
             if (amountCents > dailyRemaining) {
+                logEvent(ProtectionEvent.TYPE_LIMIT_BLOCK, amountCents,
+                         "daily limit reached", loc.locationLabel);
                 return TransactionResult.fail(
                         TransactionResult.ERR_LIMIT_EXCEEDED,
                         "Daily limit reached");
             }
+            logEvent(ProtectionEvent.TYPE_LIMIT_BLOCK, amountCents,
+                     "offline accumulation limit", loc.locationLabel);
             return TransactionResult.fail(
                     TransactionResult.ERR_OFFLINE_LIMIT,
                     "Offline accumulation limit reached");
@@ -176,6 +186,38 @@ public class ProtectionEngine {
     /** Wire in the Phase 4 personality mode adapter. */
     public void setPersonalityModeAdapter(PersonalityModeAdapter adapter) {
         mPersonality = adapter;
+    }
+
+    /** Wire in Phase 5 protection log and calibration manager. */
+    public void setPhase5Components(ProtectionLog log, CalibrationManager calibration) {
+        mProtectionLog = log;
+        mCalibration   = calibration;
+    }
+
+    /** User-reported false positive — adjusts calibration sensitivity. */
+    public void reportFalsePositive() {
+        if (mCalibration != null) {
+            mCalibration.reportFalsePositive(mProtectionLog);
+        }
+        if (mStressDetector.isProtectionActive()) {
+            mStressDetector.clearProtection();
+        }
+    }
+
+    /** Current calibration state for UI display. */
+    public za.co.circleos.sdpkt.CalibrationState getCalibrationState() {
+        if (mCalibration == null) {
+            za.co.circleos.sdpkt.CalibrationState s = new za.co.circleos.sdpkt.CalibrationState();
+            s.state = za.co.circleos.sdpkt.CalibrationState.STATE_CALIBRATED;
+            return s;
+        }
+        return mCalibration.getState();
+    }
+
+    /** Recent protection events for the log UI. */
+    public java.util.List<za.co.circleos.sdpkt.ProtectionEvent> getProtectionEvents(int limit) {
+        if (mProtectionLog == null) return java.util.Collections.emptyList();
+        return mProtectionLog.getRecent(limit);
     }
 
     /** Effective per-tap limit considering both location and personality mode (cents). */
@@ -247,10 +289,21 @@ public class ProtectionEngine {
         mNotifChannelCreated = true;
     }
 
-    /* ── Helper ─────────────────────────────────────────────── */
+    /* ── Helpers ────────────────────────────────────────────── */
 
     private String formatCents(long cents) {
         return String.format(java.util.Locale.US, "₷%,d.%02d",
                 cents / 100, Math.abs(cents % 100));
+    }
+
+    private void logEvent(int type, long amountCents, String reason, String locationLabel) {
+        if (mProtectionLog == null) return;
+        za.co.circleos.sdpkt.ProtectionEvent ev = new za.co.circleos.sdpkt.ProtectionEvent();
+        ev.type          = type;
+        ev.timestampMs   = System.currentTimeMillis();
+        ev.amountCents   = amountCents;
+        ev.reason        = reason;
+        ev.locationLabel = locationLabel;
+        mProtectionLog.append(ev);
     }
 }
