@@ -18,6 +18,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -151,11 +152,62 @@ public class QuarantineManager extends SystemService {
 
         @Override
         public boolean restore(String quarantineId, String destinationPath) {
-            // Only allowed with MANAGE_TRAFFIC_LOBBY permission
-            // Restores the quarantined file to destinationPath
-            Log.w(TAG, "Restore requested: " + quarantineId + " → " + destinationPath);
-            // TODO: implement file copy-back
-            return false;
+            if (quarantineId == null || destinationPath == null || destinationPath.isEmpty()) {
+                Log.w(TAG, "restore: invalid arguments");
+                return false;
+            }
+
+            QuarantineRecord r = mRecords.get(quarantineId);
+            if (r == null) {
+                Log.w(TAG, "restore: record not found: " + quarantineId);
+                return false;
+            }
+
+            // Locate the quarantined file: QUARANTINE_DIR/<id>/<filename>.quarantine
+            File srcFile = new File(QUARANTINE_DIR + quarantineId + "/"
+                    + r.fileName + ".quarantine");
+            if (!srcFile.exists()) {
+                Log.e(TAG, "restore: quarantined file missing: " + srcFile.getAbsolutePath());
+                return false;
+            }
+
+            // Ensure destination parent directory exists
+            File destFile = new File(destinationPath);
+            File destParent = destFile.getParentFile();
+            if (destParent != null && !destParent.exists() && !destParent.mkdirs()) {
+                Log.e(TAG, "restore: cannot create destination directory: " + destParent);
+                return false;
+            }
+
+            // Copy bytes from quarantine to destination
+            try (FileInputStream in  = new FileInputStream(srcFile);
+                 FileOutputStream out = new FileOutputStream(destFile)) {
+                byte[] buf = new byte[65536];
+                int n;
+                while ((n = in.read(buf)) > 0) out.write(buf, 0, n);
+            } catch (IOException e) {
+                Log.e(TAG, "restore: copy failed for " + quarantineId, e);
+                destFile.delete(); // clean up partial write
+                return false;
+            }
+
+            // Verify SHA256 of restored file matches quarantine record
+            if (r.sha256 != null && !r.sha256.isEmpty()) {
+                String actual = sha256Hex(destFile);
+                if (actual != null && !actual.equalsIgnoreCase(r.sha256)) {
+                    Log.e(TAG, "restore: SHA256 mismatch for " + quarantineId
+                            + " expected=" + r.sha256 + " got=" + actual);
+                    destFile.delete();
+                    return false;
+                }
+            }
+
+            // Mark record as restored
+            r.restoredAt = System.currentTimeMillis();
+            r.restoredTo = destinationPath;
+            Log.i(TAG, "Restored: " + quarantineId + " → " + destinationPath
+                    + " (" + destFile.length() + " bytes)");
+            return true;
         }
 
         @Override
@@ -207,6 +259,23 @@ public class QuarantineManager extends SystemService {
             size += f.isDirectory() ? dirSize(f) : f.length();
         }
         return size;
+    }
+
+    /** Computes SHA-256 hex digest of a file, or null on error. */
+    private static String sha256Hex(File file) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            try (FileInputStream fis = new FileInputStream(file)) {
+                byte[] buf = new byte[65536]; int n;
+                while ((n = fis.read(buf)) > 0) md.update(buf, 0, n);
+            }
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : md.digest()) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) {
+            Log.w(TAG, "sha256Hex failed for " + file, e);
+            return null;
+        }
     }
 
     private void persistRecord(QuarantineRecord r) {

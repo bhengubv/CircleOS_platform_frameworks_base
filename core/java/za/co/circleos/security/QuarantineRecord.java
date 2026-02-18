@@ -29,6 +29,8 @@ public final class QuarantineRecord implements Parcelable {
     public long    quarantinedAt;    // epoch ms
     public long    fileSizeBytes;
     public boolean submittedToFeed;  // IOCs sent to Community Defense
+    public long    restoredAt;       // epoch ms; 0 = not yet restored
+    public String  restoredTo;       // destination path used in last restore
     public List<String> iocExtracted; // IOCs found during analysis
 
     public QuarantineRecord() {
@@ -47,6 +49,8 @@ public final class QuarantineRecord implements Parcelable {
         quarantinedAt     = in.readLong();
         fileSizeBytes     = in.readLong();
         submittedToFeed   = in.readByte() != 0;
+        restoredAt        = in.readLong();
+        restoredTo        = in.readString();
         iocExtracted      = new ArrayList<>();
         in.readStringList(iocExtracted);
     }
@@ -64,6 +68,8 @@ public final class QuarantineRecord implements Parcelable {
         dest.writeLong(quarantinedAt);
         dest.writeLong(fileSizeBytes);
         dest.writeByte((byte)(submittedToFeed ? 1 : 0));
+        dest.writeLong(restoredAt);
+        dest.writeString(restoredTo);
         dest.writeStringList(iocExtracted);
     }
 
