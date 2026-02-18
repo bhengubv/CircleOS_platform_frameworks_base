@@ -17,6 +17,8 @@ import android.util.Log;
 import com.android.server.LocalServices;
 import com.android.server.SystemService;
 
+import za.co.circleos.mesh.ICircleMeshService;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -90,6 +92,31 @@ public final class CircleMeshService extends SystemService {
     private final AtomicBoolean mRunning = new AtomicBoolean(false);
     private volatile int        mBatteryPct = 100;
 
+    // ── Binder implementation ─────────────────────────────────────────────────
+
+    private final ICircleMeshService.Stub mBinder = new ICircleMeshService.Stub() {
+
+        @Override
+        public boolean sendMessage(String recipientDeviceId, byte[] payload, int msgType) {
+            return CircleMeshService.this.sendMessage(recipientDeviceId, payload, msgType);
+        }
+
+        @Override
+        public int getPeerCount() {
+            return CircleMeshService.this.getPeerCount();
+        }
+
+        @Override
+        public boolean isRunning() {
+            return CircleMeshService.this.isRunning();
+        }
+
+        @Override
+        public String getDeviceId() {
+            return CircleMeshService.this.getDeviceId();
+        }
+    };
+
     // ── Lifecycle shim ────────────────────────────────────────────────────────
 
     /**
@@ -148,6 +175,10 @@ public final class CircleMeshService extends SystemService {
         // Register with LocalServices for same-process callers
         LocalServices.addService(CircleMeshService.class, this);
         Log.i(TAG, "Registered with LocalServices");
+
+        // Publish Binder service so apps can reach us via ServiceManager
+        publishBinderService("circle.mesh", mBinder);
+        Log.i(TAG, "Published binder service: circle.mesh");
     }
 
     // ── Boot-completed ────────────────────────────────────────────────────────
