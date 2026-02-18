@@ -73,10 +73,11 @@ public final class PeerDiscovery {
 
     /**
      * BLE service UUID advertising a CircleOS mesh node.
-     * "0000CMSH-0000-1000-8000-00805F9B34FB" (placeholder)
+     * 0x1823 in the Bluetooth base-UUID form — must match
+     * {@code BluetoothLeTransport.MESH_UUID_STR}.
      */
     private static final UUID BLE_SERVICE_UUID =
-            UUID.fromString("0000CMSH-0000-1000-8000-00805F9B34FB");
+            UUID.fromString("00001823-0000-1000-8000-00805f9b34fb");
 
     /**
      * GATT characteristic UUID that carries the peer's WiFi IP:port string.
