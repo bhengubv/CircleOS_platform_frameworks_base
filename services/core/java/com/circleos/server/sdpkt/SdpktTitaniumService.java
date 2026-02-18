@@ -52,7 +52,7 @@ public class SdpktTitaniumService extends SystemService {
 
     private static final String TAG          = "SdpktTitanium";
     public  static final String SERVICE_NAME = "circle.sdpkt";
-    public  static final int    VERSION      = 3;
+    public  static final int    VERSION      = 4;
 
     private final BinderService  mBinderService = new BinderService();
 
@@ -75,6 +75,9 @@ public class SdpktTitaniumService extends SystemService {
     private WalletLocationManager mLocationManager;
     private StressDetector        mStressDetector;
     private ProtectionEngine      mProtectionEngine;
+
+    /* ── Phase 4 components ──────────────────────────────── */
+    private PersonalityModeAdapter mPersonalityAdapter;
 
     /* ── Lifecycle ────────────────────────────────────────── */
 
@@ -141,6 +144,11 @@ public class SdpktTitaniumService extends SystemService {
                     mWalletStore, mWorkerHandler);
             mLocationManager.start();
             mStressDetector.start(mWorkerHandler);
+
+            // Phase 4 — Personality mode integration
+            mPersonalityAdapter = new PersonalityModeAdapter();
+            mPersonalityAdapter.start();
+            mProtectionEngine.setPersonalityModeAdapter(mPersonalityAdapter);
 
             // Auto-initialize wallet if this is a fresh device
             if (!mKeyManager.hasKey()) {
@@ -357,6 +365,21 @@ public class SdpktTitaniumService extends SystemService {
         @Override
         public int getStressScore() {
             return mProtectionEngine != null ? mProtectionEngine.getStressScore() : 0;
+        }
+
+        @Override
+        public long getEffectivePerTapLimitCents(boolean lockScreen) {
+            if (mProtectionEngine == null) {
+                return lockScreen ? WalletStore.DEFAULT_LOCKSCREEN_CENTS
+                                  : WalletStore.DEFAULT_PER_TAP_CENTS;
+            }
+            return mProtectionEngine.getEffectivePerTapCents(lockScreen);
+        }
+
+        @Override
+        public long getEffectiveDailyLimitCents() {
+            if (mProtectionEngine == null) return WalletStore.DEFAULT_DAILY_CENTS;
+            return mProtectionEngine.getEffectiveDailyCents();
         }
 
         /* ── Phase 2: Settlement sync ─────────────── */

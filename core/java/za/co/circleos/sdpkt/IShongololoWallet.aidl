@@ -105,6 +105,18 @@ interface IShongololoWallet {
     /** 0–100 composite stress score (accelerometer + heart rate). */
     int getStressScore();
 
+    /**
+     * Effective per-tap limit in cents, accounting for location context
+     * AND the active personality mode (the stricter of the two wins).
+     */
+    long getEffectivePerTapLimitCents(boolean lockScreen);
+
+    /**
+     * Effective daily limit in cents, accounting for location context
+     * AND the active personality mode.
+     */
+    long getEffectiveDailyLimitCents();
+
     /* ── Settlement sync (Phase 2) ───────────────────────── */
 
     /**

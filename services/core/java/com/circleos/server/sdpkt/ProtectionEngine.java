@@ -47,6 +47,7 @@ public class ProtectionEngine {
     private final StressDetector        mStressDetector;
     private final WalletStore           mWalletStore;
     private final Handler               mWorkerHandler;
+    private PersonalityModeAdapter      mPersonality;  // set after construction (Phase 4)
 
     private boolean mNotifChannelCreated = false;
 
@@ -105,22 +106,32 @@ public class ProtectionEngine {
             }
         }
 
-        // ── 3. Location-based limits ─────────────────────────────────
+        // ── 3. Location + personality limits ────────────────────────
         LocationContext loc = mLocationManager.getCurrentContext();
-        if (amountCents > loc.perTapLimitCents) {
-            Log.i(TAG, "Transfer blocked — location limit (" + loc.typeName()
-                    + " per-tap=" + loc.perTapLimitCents + ")");
+        long effectivePerTap = (mPersonality != null)
+                ? mPersonality.effectivePerTapCents(loc.perTapLimitCents, loc.dailyLimitCents, lockScreen)
+                : loc.perTapLimitCents;
+        long effectiveDaily = (mPersonality != null)
+                ? mPersonality.effectiveDailyCents(loc.dailyLimitCents)
+                : loc.dailyLimitCents;
+
+        String limitContext = (mPersonality != null && mPersonality.getCurrentOverride() != PersonalityModeAdapter.OVERRIDE_NONE)
+                ? loc.typeName() + "/" + mPersonality.overrideName()
+                : loc.typeName();
+
+        if (amountCents > effectivePerTap) {
+            Log.i(TAG, "Transfer blocked — limit (" + limitContext
+                    + " per-tap=" + effectivePerTap + ")");
             return TransactionResult.fail(
                     TransactionResult.ERR_PROTECTION_LOCATION,
-                    "Location limit (" + loc.typeName() + "): "
-                    + formatCents(loc.perTapLimitCents) + " per tap");
+                    "Limit (" + limitContext + "): " + formatCents(effectivePerTap) + " per tap");
         }
 
         // ── 4. Balance and store-level checks ────────────────────────
-        //    Use location-based limits for per-tap and daily caps.
+        //    Use effective (location + personality) limits.
         //    Offline accumulation cap is always enforced in WalletStore.
         boolean debited = mWalletStore.debit(
-                amountCents, loc.perTapLimitCents, loc.dailyLimitCents);
+                amountCents, effectivePerTap, effectiveDaily);
         if (!debited) {
             // Determine why
             long balance = mWalletStore.getBalance().availableCents;
@@ -160,6 +171,25 @@ public class ProtectionEngine {
 
     public int getStressScore() {
         return mStressDetector.getStressScore();
+    }
+
+    /** Wire in the Phase 4 personality mode adapter. */
+    public void setPersonalityModeAdapter(PersonalityModeAdapter adapter) {
+        mPersonality = adapter;
+    }
+
+    /** Effective per-tap limit considering both location and personality mode (cents). */
+    public long getEffectivePerTapCents(boolean lockScreen) {
+        LocationContext loc = mLocationManager.getCurrentContext();
+        if (mPersonality == null) return loc.perTapLimitCents;
+        return mPersonality.effectivePerTapCents(loc.perTapLimitCents, loc.dailyLimitCents, lockScreen);
+    }
+
+    /** Effective daily limit considering both location and personality mode (cents). */
+    public long getEffectiveDailyCents() {
+        LocationContext loc = mLocationManager.getCurrentContext();
+        if (mPersonality == null) return loc.dailyLimitCents;
+        return mPersonality.effectiveDailyCents(loc.dailyLimitCents);
     }
 
     /* ── Deceptive denial notification ────────────────────── */
