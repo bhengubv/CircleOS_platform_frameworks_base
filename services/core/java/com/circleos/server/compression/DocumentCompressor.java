@@ -15,7 +15,9 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.zip.DataFormatException;
 import java.util.zip.Deflater;
+import java.util.zip.Inflater;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipInputStream;
 import java.util.zip.ZipOutputStream;
@@ -76,29 +78,51 @@ public class DocumentCompressor {
 
     /* ── PDF ─────────────────────────────────────────────────────────── */
 
+    /**
+     * Phase 2 PDF compression:
+     *   1. Strip XMP metadata block.
+     *   2. Re-deflate all FlateDecode image streams at BEST_COMPRESSION.
+     *
+     * Stream replacement strategy: scan for FlateDecode image streams, inflate,
+     * re-deflate at level 9. If the new stream is smaller, replace it in-place,
+     * padding with trailing spaces so all object byte offsets remain valid —
+     * avoiding the need to rebuild the cross-reference table.
+     */
     private void compressPdf(File in, File out, CompressionResult result, int tier)
             throws IOException {
         byte[] data = readAll(in);
+
+        // Step 1: strip XMP metadata
         byte[] stripped = stripPdfXmp(data);
-        // Phase 1: metadata strip only; full image recompression in Phase 2 (MuPDF native)
         if (stripped.length < data.length) {
-            try (FileOutputStream fos = new FileOutputStream(out)) {
-                fos.write(stripped);
-            }
-            result.status          = CompressionResult.STATUS_OK;
-            result.compressedBytes = out.length();
-            result.method          = "pdf-xmp-strip";
             result.metadataStripped = true;
-        } else {
+        }
+
+        // Step 2: recompress FlateDecode image streams
+        int[] stats = new int[]{0, 0}; // [streamsProcessed, bytesSaved]
+        byte[] recompressed = recompressPdfFlateStreams(stripped, stats, tier);
+
+        try (FileOutputStream fos = new FileOutputStream(out)) {
+            fos.write(recompressed);
+        }
+
+        result.status          = CompressionResult.STATUS_OK;
+        result.compressedBytes = out.length();
+
+        if (result.compressedBytes >= result.originalBytes) {
             result.status          = CompressionResult.STATUS_SKIPPED;
             result.compressedBytes = result.originalBytes;
-            result.method          = "pdf-no-xmp";
+            result.method          = "pdf-no-gain";
+        } else {
+            result.method = "pdf-xmp-strip+flate-repack"
+                    + "(streams=" + stats[0] + ",saved=" + stats[1] + "B)";
         }
+        Log.i(TAG, "PDF compress: " + in.getName() + " → " + result.method);
     }
 
     /**
      * Strip XMP metadata packet from PDF bytes.
-     * XMP packets are enclosed in: <?xpacket begin ... ?>...<?xpacket end="w"?>
+     * XMP packets are enclosed in: {@code <?xpacket begin...?>...<?xpacket end="w"?>}
      */
     private byte[] stripPdfXmp(byte[] pdf) {
         String text = new String(pdf, StandardCharsets.ISO_8859_1);
@@ -110,8 +134,184 @@ public class DocumentCompressor {
 
         ByteArrayOutputStream bos = new ByteArrayOutputStream(pdf.length);
         for (int i = 0; i < start; i++) bos.write(pdf[i]);
+        // Pad removed region with spaces to preserve byte offsets
+        for (int i = start; i < end; i++) bos.write(' ');
         for (int i = end; i < pdf.length; i++) bos.write(pdf[i]);
         return bos.toByteArray();
+    }
+
+    // ── PDF FlateDecode image stream recompression ─────────────────────────
+
+    /**
+     * Scans the PDF byte array for FlateDecode image streams and re-deflates
+     * each one at BEST_COMPRESSION. Uses in-place replacement with space-padding
+     * to preserve existing byte offsets (no xref rebuild required).
+     *
+     * Detection heuristic: look for the byte sequence {@code /FlateDecode} (or
+     * {@code /Fl }) within 512 bytes before each {@code stream\n} marker, AND
+     * {@code /Subtype /Image} (or {@code /Im}) nearby. Plain content streams
+     * (page operators) are skipped.
+     *
+     * @param pdf   Input PDF bytes (already XMP-stripped)
+     * @param stats int[]{streamsProcessed, bytesSaved} updated in-place
+     * @param tier  Compression tier (AGGRESSIVE uses level 9, else 7)
+     */
+    private byte[] recompressPdfFlateStreams(byte[] pdf, int[] stats, int tier) {
+        byte[] work = pdf.clone();
+        byte[] streamMarker    = "stream\n".getBytes(StandardCharsets.ISO_8859_1);
+        byte[] endStreamMarker = "endstream".getBytes(StandardCharsets.ISO_8859_1);
+        int deflateLevel = (tier == CompressionRequest.TIER_AGGRESSIVE)
+                ? Deflater.BEST_COMPRESSION : 7;
+
+        int pos = 0;
+        while (pos < work.length - streamMarker.length) {
+            int streamStart = indexOf(work, streamMarker, pos);
+            if (streamStart < 0) break;
+
+            int dataStart = streamStart + streamMarker.length;
+
+            // Look back up to 1024 bytes for the object dictionary
+            int dictLookback = Math.max(0, streamStart - 1024);
+            String dictText  = new String(work, dictLookback, streamStart - dictLookback,
+                    StandardCharsets.ISO_8859_1);
+
+            // Only process FlateDecode image streams
+            boolean isFlateDecode = dictText.contains("/FlateDecode")
+                    || dictText.contains("/Fl ");
+            boolean isImageStream = dictText.contains("/Subtype /Image")
+                    || dictText.contains("/Subtype/Image")
+                    || dictText.contains("/Im ")
+                    || dictText.contains("/Subtype /Form"); // forms can be large
+
+            if (!isFlateDecode || !isImageStream) {
+                pos = dataStart;
+                continue;
+            }
+
+            // Find the /Length value in the dict to know how long the stream is
+            long streamLen = extractLength(dictText);
+            if (streamLen <= 0 || dataStart + streamLen > work.length) {
+                pos = dataStart;
+                continue;
+            }
+
+            // Verify endstream marker follows
+            int dataEnd = (int) (dataStart + streamLen);
+            if (!matchesAt(work, endStreamMarker, dataEnd)
+                    && !matchesAt(work, endStreamMarker, dataEnd + 1)) {
+                pos = dataStart;
+                continue;
+            }
+
+            // Inflate the existing stream data
+            byte[] compressed = java.util.Arrays.copyOfRange(work, dataStart, dataEnd);
+            byte[] raw        = inflate(compressed);
+            if (raw == null) {
+                // Corrupted stream — skip
+                pos = dataEnd;
+                continue;
+            }
+
+            // Re-deflate at best compression
+            byte[] reDeflated = deflate(raw, deflateLevel);
+            int saved = compressed.length - reDeflated.length;
+
+            if (saved > 0 && reDeflated.length <= compressed.length) {
+                // Replace stream data in-place; pad remaining bytes with spaces
+                System.arraycopy(reDeflated, 0, work, dataStart, reDeflated.length);
+                java.util.Arrays.fill(work, dataStart + reDeflated.length, dataEnd, (byte) ' ');
+
+                // Update /Length value in-place (pad shorter number with spaces)
+                updateLengthInDict(work, dictLookback, streamStart, streamLen, reDeflated.length);
+
+                stats[0]++;
+                stats[1] += saved;
+                Log.d(TAG, "PDF FlateDecode stream recompressed: saved " + saved + " bytes");
+            }
+            pos = dataEnd;
+        }
+        return work;
+    }
+
+    /** Parse /Length N from a PDF dict text. Returns -1 if not found. */
+    private long extractLength(String dictText) {
+        java.util.regex.Matcher m =
+                java.util.regex.Pattern.compile("/Length\\s+(\\d+)").matcher(dictText);
+        return m.find() ? Long.parseLong(m.group(1)) : -1;
+    }
+
+    /** Update /Length N → /Length M in the raw work buffer, padding with spaces. */
+    private void updateLengthInDict(byte[] work, int dictStart, int dictEnd,
+                                    long oldLen, int newLen) {
+        String old = "/Length " + oldLen;
+        String nw  = "/Length " + newLen;
+        // Pad new string to same length as old with trailing spaces
+        while (nw.length() < old.length()) nw += " ";
+        byte[] oldB = old.getBytes(StandardCharsets.ISO_8859_1);
+        byte[] newB = nw.getBytes(StandardCharsets.ISO_8859_1);
+        int idx = indexOf(work, oldB, dictStart);
+        if (idx >= 0 && idx < dictEnd) {
+            System.arraycopy(newB, 0, work, idx, Math.min(newB.length, oldB.length));
+        }
+    }
+
+    /** Inflate a DEFLATE-compressed byte array. Returns null on error. */
+    private static byte[] inflate(byte[] data) {
+        Inflater inflater = new Inflater();
+        try {
+            inflater.setInput(data);
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(data.length * 3);
+            byte[] buf = new byte[32768];
+            while (!inflater.finished()) {
+                int n = inflater.inflate(buf);
+                if (n == 0 && inflater.needsInput()) break;
+                bos.write(buf, 0, n);
+            }
+            return bos.toByteArray();
+        } catch (DataFormatException e) {
+            Log.w(TAG, "inflate failed", e);
+            return null;
+        } finally {
+            inflater.end();
+        }
+    }
+
+    /** Deflate raw bytes at the given compression level. */
+    private static byte[] deflate(byte[] data, int level) {
+        Deflater deflater = new Deflater(level);
+        try {
+            deflater.setInput(data);
+            deflater.finish();
+            ByteArrayOutputStream bos = new ByteArrayOutputStream(data.length);
+            byte[] buf = new byte[32768];
+            while (!deflater.finished()) {
+                bos.write(buf, 0, deflater.deflate(buf));
+            }
+            return bos.toByteArray();
+        } finally {
+            deflater.end();
+        }
+    }
+
+    /** Find needle in haystack starting at fromIndex. Returns -1 if not found. */
+    private static int indexOf(byte[] haystack, byte[] needle, int fromIndex) {
+        outer:
+        for (int i = fromIndex; i <= haystack.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) continue outer;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    /** Returns true if needle matches haystack at position pos. */
+    private static boolean matchesAt(byte[] haystack, byte[] needle, int pos) {
+        if (pos < 0 || pos + needle.length > haystack.length) return false;
+        for (int i = 0; i < needle.length; i++) {
+            if (haystack[pos + i] != needle[i]) return false;
+        }
+        return true;
     }
 
     /* ── Office ZIP containers ──────────────────────────────────────── */
