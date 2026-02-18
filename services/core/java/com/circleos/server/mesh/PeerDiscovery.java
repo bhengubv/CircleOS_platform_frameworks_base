@@ -6,7 +6,13 @@
 package com.circleos.server.mesh;
 
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothGatt;
+import android.bluetooth.BluetoothGattCallback;
+import android.bluetooth.BluetoothGattCharacteristic;
+import android.bluetooth.BluetoothGattService;
 import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothProfile;
 import android.bluetooth.le.BluetoothLeScanner;
 import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanFilter;
@@ -30,11 +36,14 @@ import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -68,6 +77,14 @@ public final class PeerDiscovery {
      */
     private static final UUID BLE_SERVICE_UUID =
             UUID.fromString("0000CMSH-0000-1000-8000-00805F9B34FB");
+
+    /**
+     * GATT characteristic UUID that carries the peer's WiFi IP:port string.
+     * Matches the UUID registered by BluetoothLeTransport on the server side.
+     * Value format: "192.168.1.42:9847" (UTF-8, no null terminator).
+     */
+    private static final UUID WIFI_IP_CHAR_UUID =
+            UUID.fromString("00001824-0000-1000-8000-00805f9b34fb");
 
     // -------------------------------------------------------------------------
     // Inner types
@@ -152,6 +169,10 @@ public final class PeerDiscovery {
     // Bluetooth LE
     private BluetoothLeScanner      mBleScanner;
     private ScanCallback            mBleScanCallback;
+
+    /** BLE addresses for which a GATT connection is currently in progress. */
+    private final Set<String> mGattConnecting =
+            Collections.synchronizedSet(new HashSet<>());
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -460,13 +481,92 @@ public final class PeerDiscovery {
     }
 
     private void handleBleScanResult(ScanResult result) {
-        // BLE only tells us a device is nearby. Actual chunk transfer happens
-        // over TCP. The BLE characteristic would carry the device's WiFi IP
-        // address. For now we record the device's Bluetooth address and log it;
-        // the full GATT exchange is left for a future implementation phase.
-        String bleAddr = result.getDevice().getAddress();
+        BluetoothDevice device = result.getDevice();
+        final String bleAddr = device.getAddress();
         Slog.d(TAG, "BLE peer found: " + bleAddr + " rssi=" + result.getRssi());
-        // TODO(Phase 5): connect GATT, read WiFi-IP characteristic, then probeAndRegisterPeer()
+
+        // Skip if we already have a live peer entry keyed by this BLE address.
+        synchronized (mPeers) {
+            if (mPeers.containsKey(bleAddr)) return;
+        }
+        // Skip if a GATT connection attempt is already in flight for this address.
+        if (!mGattConnecting.add(bleAddr)) return;
+
+        device.connectGatt(mContext, /* autoConnect= */ false, new BluetoothGattCallback() {
+
+            @Override
+            public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
+                if (newState == BluetoothProfile.STATE_CONNECTED) {
+                    Slog.d(TAG, "GATT connected to " + bleAddr + "; discovering services");
+                    gatt.discoverServices();
+                } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    Slog.d(TAG, "GATT disconnected from " + bleAddr);
+                    mGattConnecting.remove(bleAddr);
+                    gatt.close();
+                }
+            }
+
+            @Override
+            public void onServicesDiscovered(BluetoothGatt gatt, int status) {
+                if (status != BluetoothGatt.GATT_SUCCESS) {
+                    Slog.w(TAG, "GATT service discovery failed on " + bleAddr + ": " + status);
+                    mGattConnecting.remove(bleAddr);
+                    gatt.disconnect();
+                    return;
+                }
+                BluetoothGattService service = gatt.getService(BLE_SERVICE_UUID);
+                if (service == null) {
+                    Slog.w(TAG, "GATT: CircleOS mesh service not found on " + bleAddr);
+                    mGattConnecting.remove(bleAddr);
+                    gatt.disconnect();
+                    return;
+                }
+                BluetoothGattCharacteristic wifiIpChar = service.getCharacteristic(WIFI_IP_CHAR_UUID);
+                if (wifiIpChar == null) {
+                    Slog.w(TAG, "GATT: WiFi-IP characteristic not found on " + bleAddr);
+                    mGattConnecting.remove(bleAddr);
+                    gatt.disconnect();
+                    return;
+                }
+                if (!gatt.readCharacteristic(wifiIpChar)) {
+                    Slog.w(TAG, "GATT: readCharacteristic initiation failed on " + bleAddr);
+                    mGattConnecting.remove(bleAddr);
+                    gatt.disconnect();
+                }
+            }
+
+            // API 33+ override — preferred on Android 14.
+            @Override
+            public void onCharacteristicRead(BluetoothGatt gatt,
+                    BluetoothGattCharacteristic characteristic,
+                    byte[] value, int status) {
+                mGattConnecting.remove(bleAddr);
+                gatt.disconnect();
+
+                if (status != BluetoothGatt.GATT_SUCCESS || value == null || value.length == 0) {
+                    Slog.w(TAG, "GATT: characteristic read failed on " + bleAddr + ": " + status);
+                    return;
+                }
+                // Value format: "192.168.1.42:9847" (UTF-8)
+                String raw = new String(value, StandardCharsets.UTF_8).trim();
+                int sep = raw.lastIndexOf(':');
+                if (sep < 7) { // minimal valid: "1.2.3.4:1"
+                    Slog.w(TAG, "GATT: unexpected WiFi-IP value from " + bleAddr + ": \"" + raw + "\"");
+                    return;
+                }
+                String wifiIp = raw.substring(0, sep);
+                int wifiPort;
+                try {
+                    wifiPort = Integer.parseInt(raw.substring(sep + 1));
+                } catch (NumberFormatException e) {
+                    wifiPort = MESH_PORT;
+                }
+                Slog.i(TAG, "GATT: BLE peer " + bleAddr + " → WiFi " + wifiIp + ":" + wifiPort);
+                final String ip   = wifiIp;
+                final int    port = wifiPort;
+                mConnectPool.execute(() -> probeAndRegisterPeer(ip, port, DiscoveryMethod.BLUETOOTH_LE));
+            }
+        }, BluetoothDevice.TRANSPORT_LE);
     }
 
     private void stopBleDiscovery() {
