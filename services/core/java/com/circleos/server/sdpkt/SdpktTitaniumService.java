@@ -13,6 +13,7 @@ import com.android.server.SystemService;
 import za.co.circleos.sdpkt.IShongololoWallet;
 import za.co.circleos.sdpkt.NfcTransferRequest;
 import za.co.circleos.sdpkt.ShongololoTransaction;
+import za.co.circleos.sdpkt.SyncStatus;
 import za.co.circleos.sdpkt.TransactionResult;
 import za.co.circleos.sdpkt.WalletBalance;
 import za.co.circleos.sdpkt.WalletKey;
@@ -26,11 +27,15 @@ import java.util.List;
  * Service name: "circle.sdpkt"
  *
  * Architecture:
- *   TeeKeyManager     — ECDSA keypair in Android Keystore (StrongBox/TEE)
- *   TransactionSigner — sign outbound, verify inbound (offline)
- *   NonceCache        — replay protection (24h nonce TTL)
- *   WalletStore       — TEE-signed balance + transaction history
- *   NfcProtocolEngine — SDPKT NFC handshake state machine
+ *   TeeKeyManager        — ECDSA keypair in Android Keystore (StrongBox/TEE)
+ *   TransactionSigner    — sign outbound, verify inbound (offline)
+ *   NonceCache           — replay protection (24h nonce TTL)
+ *   WalletStore          — TEE-signed balance + transaction history
+ *   NfcProtocolEngine    — SDPKT NFC handshake state machine
+ *   OfflineTransactionLog— persistent pending.jsonl for outbound txs (Phase 2)
+ *   DoubleSpendDetector  — nonce, txId, rate-limit, blacklist checks (Phase 2)
+ *   SettlementQueue      — drains pending log on network connect (Phase 2)
+ *   SyncManager          — ConnectivityManager callbacks → settlement drain (Phase 2)
  *
  * NFC transport is handled by the SdpktTitanium privileged app
  * (vendor/circle/apps/SdpktTitanium) which registers a HostApduService
@@ -46,9 +51,11 @@ public class SdpktTitaniumService extends SystemService {
 
     private static final String TAG          = "SdpktTitanium";
     public  static final String SERVICE_NAME = "circle.sdpkt";
-    public  static final int    VERSION      = 1;
+    public  static final int    VERSION      = 2;
 
     private final BinderService  mBinderService = new BinderService();
+
+    /* ── Phase 1 components ──────────────────────────────── */
     private TeeKeyManager        mKeyManager;
     private TransactionSigner    mSigner;
     private NonceCache           mNonceCache;
@@ -57,7 +64,13 @@ public class SdpktTitaniumService extends SystemService {
     private HandlerThread        mWorkerThread;
     private android.os.Handler   mWorkerHandler;
 
-    /* ── Lifecycle ────────────────────────────────────── */
+    /* ── Phase 2 components ──────────────────────────────── */
+    private OfflineTransactionLog mOfflineLog;
+    private DoubleSpendDetector   mDSD;
+    private SettlementQueue       mSettlementQueue;
+    private SyncManager           mSyncManager;
+
+    /* ── Lifecycle ────────────────────────────────────────── */
 
     public static class Lifecycle extends SystemService {
         private SdpktTitaniumService mService;
@@ -92,11 +105,27 @@ public class SdpktTitaniumService extends SystemService {
             mWorkerThread.start();
             mWorkerHandler = new android.os.Handler(mWorkerThread.getLooper());
 
+            // Phase 1 components
             mKeyManager  = new TeeKeyManager();
             mSigner      = new TransactionSigner(mKeyManager);
             mNonceCache  = new NonceCache();
             mWalletStore = new WalletStore(mKeyManager);
             mNfcEngine   = new NfcProtocolEngine(mKeyManager, mSigner, mNonceCache);
+
+            // Phase 2 components
+            mOfflineLog      = new OfflineTransactionLog();
+            mDSD             = new DoubleSpendDetector(mNonceCache, mOfflineLog, mSigner);
+            mSettlementQueue = new SettlementQueue(mOfflineLog, mWalletStore, mSigner, mNonceCache);
+            mSyncManager     = new SyncManager(getContext(), mSettlementQueue, mWorkerHandler);
+
+            // Wire NfcProtocolEngine to the double-spend detector
+            mNfcEngine.setDoubleSpendDetector(mDSD);
+
+            // Restore pending transactions from disk (survived a reboot)
+            mSettlementQueue.restoreFromLog();
+
+            // Start connectivity listener
+            mSyncManager.start();
 
             // Auto-initialize wallet if this is a fresh device
             if (!mKeyManager.hasKey()) {
@@ -108,11 +137,11 @@ public class SdpktTitaniumService extends SystemService {
                 });
             }
 
-            Log.i(TAG, "SdpktTitaniumService boot-complete init done");
+            Log.i(TAG, "SdpktTitaniumService boot-complete init done (v" + VERSION + ")");
         }
     }
 
-    /* ── Binder ───────────────────────────────────────── */
+    /* ── Binder ───────────────────────────────────────────── */
 
     private final class BinderService extends IShongololoWallet.Stub {
 
@@ -166,11 +195,22 @@ public class SdpktTitaniumService extends SystemService {
                 // Unknown session — this is the receiver: create receiver session
                 String receiverSessionId = mNfcEngine.beginReceiverSession(incomingBase64);
                 if (receiverSessionId == null) return null;
-                // Build and return ADVERTISE response
                 return buildAdvertise(receiverSessionId);
             }
 
-            return mNfcEngine.processMessage(sessionId, incomingBase64);
+            String response = mNfcEngine.processMessage(sessionId, incomingBase64);
+
+            // If the sender session just completed (state=DONE), enqueue for settlement
+            NfcProtocolEngine.Session updated = mNfcEngine.getSession(sessionId);
+            if (updated != null
+                    && updated.isSender
+                    && updated.state == NfcProtocolEngine.STATE_DONE
+                    && updated.pendingTx != null) {
+                mSettlementQueue.enqueue(updated.pendingTx);
+                mNfcEngine.cancelSession(sessionId); // clean up after enqueue
+            }
+
+            return response;
         }
 
         private String buildAdvertise(String sessionId) {
@@ -182,8 +222,7 @@ public class SdpktTitaniumService extends SystemService {
                 deviceId = TeeKeyManager.sha256Hex(bytes);
             } catch (Exception e) { deviceId = "unknown"; }
             String json = "{\"type\":\"advertise\",\"pubkey\":\"" + pubkey
-                        + "\",\"device_id\":\"" + deviceId + "\",\"version\":1}";
-            // Encode as ADVERTISE message
+                        + "\",\"device_id\":\"" + deviceId + "\",\"version\":2}";
             byte[] jsonBytes = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
             byte[] msg = new byte[1 + jsonBytes.length];
             msg[0] = NfcProtocolEngine.MSG_ADVERTISE;
@@ -206,8 +245,25 @@ public class SdpktTitaniumService extends SystemService {
                     TransactionResult.ERR_INTERNAL, "No pending transaction");
 
             ShongololoTransaction tx = s.pendingTx;
+
+            // Phase 2: double-spend check on receive
+            if (mDSD != null) {
+                int dsdResult = mDSD.check(tx);
+                if (dsdResult != DoubleSpendDetector.OK) {
+                    Log.w(TAG, "Incoming transfer rejected by DSD: "
+                            + DoubleSpendDetector.describe(dsdResult));
+                    mNfcEngine.cancelSession(sessionId);
+                    return TransactionResult.fail(
+                            TransactionResult.ERR_INVALID_SIGNATURE,
+                            "Security check failed: " + DoubleSpendDetector.describe(dsdResult));
+                }
+                mDSD.recordAccepted(tx);
+            }
+
             mWalletStore.credit(tx.amountCents);
             mWalletStore.addTransaction(tx);
+            // Inbound transactions auto-settle immediately (funds verified via ECDSA)
+            mWalletStore.settle(tx);
 
             WalletBalance bal = mWalletStore.getBalance();
             Log.i(TAG, "Received " + tx.amountCents + " cents from " + tx.senderDeviceId);
@@ -252,6 +308,36 @@ public class SdpktTitaniumService extends SystemService {
             if (mWalletStore == null) return 0;
             return mWalletStore.getOfflineAccumulationCents();
         }
+
+        /* ── Phase 2: Settlement sync ─────────────── */
+
+        @Override
+        public List<ShongololoTransaction> getPendingTransactions() {
+            if (mOfflineLog == null) return new java.util.ArrayList<>();
+            return mOfflineLog.getPending();
+        }
+
+        @Override
+        public SyncStatus getSyncStatus() {
+            if (mSyncManager == null) {
+                SyncStatus s = new SyncStatus();
+                s.state = SyncStatus.STATE_OFFLINE;
+                return s;
+            }
+            return mSyncManager.getStatus();
+        }
+
+        @Override
+        public void forceSyncNow() {
+            if (mSyncManager != null) mSyncManager.forceSyncNow();
+        }
+
+        @Override
+        public int getPendingCount() {
+            return mSettlementQueue != null ? mSettlementQueue.getPendingCount() : 0;
+        }
+
+        /* ── Service info ─────────────────────────── */
 
         @Override
         public int getServiceVersion() { return VERSION; }

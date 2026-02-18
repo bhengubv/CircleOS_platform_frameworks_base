@@ -4,13 +4,13 @@
  */
 package za.co.circleos.sdpkt;
 
-import android.os.ParcelFileDescriptor;
 import za.co.circleos.sdpkt.WalletKey;
 import za.co.circleos.sdpkt.WalletBalance;
 import za.co.circleos.sdpkt.ShongololoTransaction;
 import za.co.circleos.sdpkt.TransactionResult;
 import za.co.circleos.sdpkt.NfcTransferRequest;
 import za.co.circleos.sdpkt.INfcTransferCallback;
+import za.co.circleos.sdpkt.SyncStatus;
 
 /**
  * SDPKT Titanium wallet binder interface.
@@ -92,6 +92,26 @@ interface IShongololoWallet {
 
     /** Total offline spending since last sync, in cents. */
     long getOfflineAccumulationCents();
+
+    /* ── Settlement sync (Phase 2) ───────────────────────── */
+
+    /**
+     * All outbound transactions awaiting settlement (PENDING_SETTLEMENT status).
+     * Newest-first.
+     */
+    List<ShongololoTransaction> getPendingTransactions();
+
+    /** Current sync state snapshot. */
+    SyncStatus getSyncStatus();
+
+    /**
+     * Trigger immediate settlement drain if network is available.
+     * No-op if offline.
+     */
+    void forceSyncNow();
+
+    /** Number of outbound transactions not yet settled. */
+    int getPendingCount();
 
     /* ── Service info ────────────────────────────────── */
 

@@ -90,6 +90,7 @@ public class NfcProtocolEngine {
     private final TeeKeyManager    mKeyManager;
     private final TransactionSigner mSigner;
     private final NonceCache        mNonceCache;
+    private DoubleSpendDetector     mDSD;  // set after construction (Phase 2)
 
     // active sessions
     private final ConcurrentHashMap<String, Session> mSessions = new ConcurrentHashMap<>();
@@ -98,6 +99,11 @@ public class NfcProtocolEngine {
         mKeyManager  = km;
         mSigner      = signer;
         mNonceCache  = nc;
+    }
+
+    /** Wire in the Phase 2 double-spend detector. */
+    public void setDoubleSpendDetector(DoubleSpendDetector dsd) {
+        mDSD = dsd;
     }
 
     /* ── Sender side ─────────────────────────────────── */
@@ -281,10 +287,21 @@ public class NfcProtocolEngine {
         ShongololoTransaction tx = jsonToTx(json);
         if (tx == null) return buildError(s.sessionId, "Malformed transaction");
 
-        int verifyResult = mSigner.verify(tx, mNonceCache);
-        if (verifyResult != TransactionSigner.VERIFY_OK) {
-            s.state = STATE_FAILED;
-            return buildError(s.sessionId, "Verification failed: " + verifyResult);
+        // Phase 2: full double-spend + replay + rate-limit check
+        if (mDSD != null) {
+            int dsdResult = mDSD.check(tx);
+            if (dsdResult != DoubleSpendDetector.OK) {
+                s.state = STATE_FAILED;
+                Log.w(TAG, "DSD rejected tx: " + DoubleSpendDetector.describe(dsdResult));
+                return buildError(s.sessionId, "Rejected: " + DoubleSpendDetector.describe(dsdResult));
+            }
+        } else {
+            // Phase 1 fallback: basic signature + replay check only
+            int verifyResult = mSigner.verify(tx, mNonceCache);
+            if (verifyResult != TransactionSigner.VERIFY_OK) {
+                s.state = STATE_FAILED;
+                return buildError(s.sessionId, "Verification failed: " + verifyResult);
+            }
         }
 
         s.pendingTx = tx;
