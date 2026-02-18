@@ -5,88 +5,107 @@
  */
 package com.circleos.server.mesh;
 
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.BatteryManager;
 import android.os.Handler;
 import android.os.HandlerThread;
-import android.util.Slog;
+import android.util.Log;
 
 import com.android.server.LocalServices;
 import com.android.server.SystemService;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * CircleOS Mesh OTA Delivery Service (Phase 4).
+ * CircleOS Circle Mesh Network Service (full stack).
  *
- * Internal system service that coordinates P2P chunk acquisition for OTA
- * updates using WiFi Direct, mDNS (same-LAN WiFi), and Bluetooth LE.
+ * <p>This service orchestrates the complete peer-to-peer mesh stack:
+ * <ul>
+ *   <li>{@link MeshCrypto}     — identity, encryption, rotating device ID</li>
+ *   <li>{@link PeerManager}    — live peer table with TTL pruning</li>
+ *   <li>{@link MessageStore}   — SQLite store-and-forward queue</li>
+ *   <li>{@link MeshRouter}     — direct / relay / flood routing</li>
+ *   <li>{@link WifiDirectTransport} — TCP over WiFi Direct (port 9847)</li>
+ *   <li>{@link MdnsTransport}  — TCP over LAN mDNS (port 8723)</li>
+ *   <li>{@link BluetoothLeTransport} — BLE discovery-only</li>
+ * </ul>
  *
- * This service has no public Binder interface. It is invoked directly by
- * CircleUpdateService via {@link LocalServices}.
+ * <h3>Battery policy</h3>
+ * <ul>
+ *   <li>Battery ≥ 50%: full mesh (all transports + relay enabled).</li>
+ *   <li>Battery 20–49%: relay disabled; direct messages only.</li>
+ *   <li>Battery &lt; 20%: mesh suspended; only emergency (URGENT) frames processed.</li>
+ * </ul>
  *
- * Lifecycle:
- *   SystemServer → Lifecycle.onStart() (no-op for Binder)
- *   SystemServer → Lifecycle.onBootPhase(PHASE_BOOT_COMPLETED)
- *                → CircleMeshService.onBootCompleted()
- *                → LocalServices.addService(CircleMeshService.class, this)
+ * <h3>Periodic tasks</h3>
+ * <ul>
+ *   <li>Every 30 s: broadcast ANNOUNCE frame to all direct peers.</li>
+ *   <li>Every 60 s: flush store-and-forward queue to newly-online peers.</li>
+ *   <li>Every 24 h: prune stale messages from MessageStore.</li>
+ * </ul>
  *
- * Download flow:
- *   1. Create ChunkManager with the update manifest.
- *   2. Start ChunkServer so we immediately serve any pre-held chunks.
- *   3. Start PeerDiscovery for the target version.
- *   4. Worker loop: for each missing chunk, try each known peer first
- *      (ChunkClient), then fall back to CDN HTTP range request.
- *   5. When all chunks are present, assemble and call onComplete().
- *   6. Progress callback every PROGRESS_INTERVAL chunks acquired.
+ * <h3>Registration</h3>
+ * No public Binder. Callers in the same process use {@link LocalServices} to
+ * retrieve this service as {@link CircleMeshService}.
  */
 public final class CircleMeshService extends SystemService {
 
     private static final String TAG = "CircleMeshService";
 
-    /** Service name used with LocalServices (not publishBinderService). */
-    public static final String SERVICE_NAME = "circle.mesh";
+    /** LocalServices registration class. */
+    public static final String SERVICE_CLASS = CircleMeshService.class.getName();
 
-    /** Report progress every N chunks acquired. */
-    private static final int PROGRESS_INTERVAL = 5;
+    // Periodic task intervals
+    private static final long ANNOUNCE_INTERVAL_MS   = 30_000L;
+    private static final long FLUSH_INTERVAL_MS      = 60_000L;
+    private static final long PRUNE_INTERVAL_MS      = 24L * 60 * 60 * 1_000;
 
-    /** CDN base URL for fallback HTTP chunk downloads. */
-    private static final String CDN_BASE_URL = "https://updates.circleos.org/chunks/";
+    // Battery thresholds
+    private static final int BATT_RELAY_MIN     = 50; // relay disabled below this %
+    private static final int BATT_SUSPEND_MIN   = 20; // mesh suspended below this %
 
-    /** HTTP connect timeout for CDN fallback (ms). */
-    private static final int CDN_CONNECT_TIMEOUT_MS = 15_000;
-    /** HTTP read timeout for CDN fallback (ms). */
-    private static final int CDN_READ_TIMEOUT_MS    = 60_000;
+    // ── Sub-components ────────────────────────────────────────────────────────
 
-    // -------------------------------------------------------------------------
-    // Lifecycle inner class
-    // -------------------------------------------------------------------------
+    private MeshCrypto    mCrypto;
+    private PeerManager   mPeerManager;
+    private MessageStore  mMessageStore;
+    private MeshRouter    mRouter;
+
+    private WifiDirectTransport     mWifiTransport;
+    private BluetoothLeTransport    mBleTransport;
+    private MdnsTransport           mMdnsTransport;
+
+    // ── Threading ─────────────────────────────────────────────────────────────
+
+    private HandlerThread mHandlerThread;
+    private Handler       mHandler;
+
+    // ── State ─────────────────────────────────────────────────────────────────
+
+    private final AtomicBoolean mRunning = new AtomicBoolean(false);
+    private volatile int        mBatteryPct = 100;
+
+    // ── Lifecycle shim ────────────────────────────────────────────────────────
 
     /**
-     * Standard SystemService Lifecycle shim registered in SystemServer.
-     *
-     * CircleMeshService has no Binder — it is accessed via LocalServices by
-     * other Circle system services (primarily CircleUpdateService).
+     * SystemService lifecycle shim registered in SystemServer.
      */
-    public static class Lifecycle extends SystemService {
-        private final CircleMeshService mService;
+    public static final class Lifecycle extends SystemService {
+        private CircleMeshService mService;
 
         public Lifecycle(Context context) {
             super(context);
-            mService = new CircleMeshService(context);
         }
 
         @Override
         public void onStart() {
-            // No Binder to publish — LocalServices registration happens at boot.
-            Slog.i(TAG, "CircleMeshService.Lifecycle.onStart (no binder)");
+            mService = new CircleMeshService(getContext());
+            mService.onStart();
         }
 
         @Override
@@ -97,441 +116,360 @@ public final class CircleMeshService extends SystemService {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Public callback interface
-    // -------------------------------------------------------------------------
-
-    /**
-     * Callback delivered to the caller of {@link #startMeshDownload}.
-     */
-    public interface MeshDownloadCallback {
-        /** Called when all chunks have been assembled into a verified zip. */
-        void onComplete(File assembledFile);
-        /** Called when the download cannot be completed. */
-        void onFailed(String reason);
-        /** Called periodically as chunks are acquired. */
-        void onProgress(int chunksHave, int chunksTotal);
-    }
-
-    // -------------------------------------------------------------------------
-    // State
-    // -------------------------------------------------------------------------
-
-    private final HandlerThread   mThread;
-    private final Handler         mHandler;
-
-    private final AtomicBoolean   mDownloadRunning = new AtomicBoolean(false);
-
-    // Components for the active download session — null when idle.
-    private volatile ChunkManager   mChunkManager;
-    private volatile ChunkServer    mChunkServer;
-    private volatile PeerDiscovery  mPeerDiscovery;
-    private volatile MeshDownloadCallback mCallback;
-    private volatile File           mDestFile;
-
-    // -------------------------------------------------------------------------
-    // Constructor
-    // -------------------------------------------------------------------------
+    // ── Constructor ───────────────────────────────────────────────────────────
 
     public CircleMeshService(Context context) {
         super(context);
-        mThread = new HandlerThread("CircleMesh");
-        mThread.start();
-        mHandler = new Handler(mThread.getLooper());
     }
 
-    // -------------------------------------------------------------------------
-    // SystemService overrides
-    // -------------------------------------------------------------------------
+    // ── SystemService overrides ───────────────────────────────────────────────
 
     @Override
     public void onStart() {
-        // Not called directly; the Lifecycle shim manages this.
-    }
+        Log.i(TAG, "onStart()");
 
-    // -------------------------------------------------------------------------
-    // Boot-completed initialisation
-    // -------------------------------------------------------------------------
+        mHandlerThread = new HandlerThread("CircleMesh");
+        mHandlerThread.start();
+        mHandler = new Handler(mHandlerThread.getLooper());
 
-    /**
-     * Called by {@link Lifecycle} when the system has fully booted.
-     * Registers this service with LocalServices so CircleUpdateService can
-     * retrieve it without a Binder round-trip.
-     */
-    void onBootCompleted() {
+        // Initialise components
+        mCrypto       = new MeshCrypto();
+        mPeerManager  = new PeerManager();
+        mMessageStore = new MessageStore(getContext());
+
+        mCrypto.init();
+        String deviceId = mCrypto.getDeviceId();
+        Log.i(TAG, "Device ID: " + deviceId);
+
+        mRouter = new MeshRouter(deviceId, mPeerManager);
+        mRouter.setDeliveryListener(this::onMessageDelivered);
+        mRouter.setSender(this::dispatchToPeer);
+
+        // Register with LocalServices for same-process callers
         LocalServices.addService(CircleMeshService.class, this);
-        Slog.i(TAG, "CircleMeshService registered with LocalServices");
+        Log.i(TAG, "Registered with LocalServices");
     }
 
-    // -------------------------------------------------------------------------
-    // Public API
-    // -------------------------------------------------------------------------
+    // ── Boot-completed ────────────────────────────────────────────────────────
 
-    /**
-     * Begins a mesh-assisted OTA chunk download.
-     *
-     * If a download is already in progress it is stopped before starting the
-     * new one.
-     *
-     * @param version      OTA version string (e.g. "1.2.3-alpha").
-     * @param manifestJson Chunk manifest JSON from the update server.
-     * @param destFile     Destination file for the assembled OTA zip (the file
-     *                     will be created/overwritten by ChunkManager).
-     * @param callback     Progress and completion notifications.
-     */
-    public void startMeshDownload(String version, String manifestJson,
-            File destFile, MeshDownloadCallback callback) {
-        Slog.i(TAG, "startMeshDownload: version=" + version);
-        stopMeshDownload(); // Stop any previous session
+    void onBootCompleted() {
+        Log.i(TAG, "onBootCompleted() — starting mesh");
 
-        mCallback  = callback;
-        mDestFile  = destFile;
-        mDownloadRunning.set(true);
+        // Monitor battery level
+        registerBatteryReceiver();
 
-        mHandler.post(() -> runDownload(version, manifestJson));
+        // Start the mesh on the handler thread
+        mHandler.post(this::startMesh);
     }
 
-    /**
-     * Stops any in-progress mesh download and tears down all associated
-     * resources.
-     */
-    public void stopMeshDownload() {
-        if (!mDownloadRunning.compareAndSet(true, false)) return;
+    // ── Mesh start / stop ─────────────────────────────────────────────────────
 
-        Slog.i(TAG, "stopMeshDownload");
+    private void startMesh() {
+        if (!mRunning.compareAndSet(false, true)) return;
+        Log.i(TAG, "Starting mesh stack");
 
-        mHandler.post(() -> {
-            if (mPeerDiscovery != null) {
-                mPeerDiscovery.stopDiscovery();
-                mPeerDiscovery = null;
-            }
-            if (mChunkServer != null) {
-                mChunkServer.stop();
-                mChunkServer = null;
-            }
-            mChunkManager = null;
-            mCallback      = null;
-        });
-    }
+        String deviceId = mCrypto.getDeviceId();
+        String caps     = "OTA,MSG,TX,BTL,FILE";
 
-    // -------------------------------------------------------------------------
-    // Download orchestration
-    // -------------------------------------------------------------------------
+        // Initialise transports
+        mWifiTransport = new WifiDirectTransport(getContext(), deviceId, caps, "0.1.0-alpha");
+        mMdnsTransport = new MdnsTransport(getContext(), deviceId, caps);
+        mBleTransport  = new BluetoothLeTransport(getContext(), deviceId);
 
-    /**
-     * Main download worker, runs on the CircleMesh HandlerThread.
-     *
-     * Steps:
-     *   1. Create ChunkManager.
-     *   2. Start ChunkServer.
-     *   3. Start PeerDiscovery.
-     *   4. Loop over missing chunks: peer first, CDN fallback.
-     *   5. Assemble and complete.
-     */
-    private void runDownload(String version, String manifestJson) {
-        MeshDownloadCallback cb = mCallback;
+        // Wire up listeners
+        MeshTransport.MessageListener msgListener = (from, transport, frame) ->
+                mHandler.post(() -> mRouter.handleIncoming(frame, from, transport));
 
-        // 1. Create ChunkManager
-        ChunkManager cm;
-        try {
-            cm = new ChunkManager(getContext(), version, manifestJson);
-        } catch (Exception e) {
-            Slog.e(TAG, "runDownload: failed to create ChunkManager", e);
-            if (cb != null) cb.onFailed("Manifest parse error: " + e.getMessage());
-            return;
-        }
-        mChunkManager = cm;
-
-        int total = cm.getTotalChunks();
-        Slog.i(TAG, "runDownload: total=" + total + " have=" + countHave(cm));
-
-        // Initial progress report
-        if (cb != null) cb.onProgress(countHave(cm), total);
-
-        // 2. Start ChunkServer so we can serve what we already have
-        ChunkServer server = new ChunkServer(getContext(), cm);
-        mChunkServer = server;
-        try {
-            server.start();
-        } catch (IOException e) {
-            // Non-fatal — we can still download even if we can't serve
-            Slog.w(TAG, "runDownload: ChunkServer failed to start (will not serve peers)", e);
-        }
-
-        // 3. Start PeerDiscovery
-        PeerDiscovery discovery = new PeerDiscovery(getContext(), new PeerDiscovery.PeerListener() {
+        MeshTransport.PeerDiscoveryListener discoveryListener = new MeshTransport.PeerDiscoveryListener() {
             @Override
-            public void onPeerFound(PeerDiscovery.PeerInfo peer) {
-                Slog.i(TAG, "Peer available: " + peer);
-                // Immediately schedule a fill pass when a new peer appears
-                mHandler.post(() -> fillMissingChunksFromPeers(cm, discovery, cb, total));
+            public void onPeerDiscovered(String peerId, String address, int port,
+                    String transport, String caps) {
+                Log.d(TAG, "Peer discovered: id=" + peerId + " addr=" + address
+                        + " transport=" + transport);
+                PeerManager.PeerInfo peer = new PeerManager.PeerInfo(
+                        peerId, transport, address, port, 0);
+                if (caps != null) {
+                    for (String cap : caps.split(",")) {
+                        if (!cap.isEmpty()) peer.capabilities.add(cap.trim());
+                    }
+                }
+                mPeerManager.addOrUpdatePeer(peer);
+                // Attempt to flush queued messages for this peer
+                mHandler.post(() -> flushStoredMessages(peerId));
             }
+
             @Override
-            public void onPeerLost(String peerId) {
-                Slog.i(TAG, "Peer lost: " + peerId);
+            public void onPeerLost(String address) {
+                Log.d(TAG, "Peer lost at address: " + address);
+                // We don't know the device ID from address alone — peer table TTL handles cleanup
             }
-        });
-        mPeerDiscovery = discovery;
+        };
 
-        // Also register ourselves so other devices discover us
-        discovery.registerSelf(version, cm.getChunkBitmap());
-        discovery.startDiscovery(version);
+        mWifiTransport.setMessageListener(msgListener);
+        mWifiTransport.setPeerDiscoveryListener(discoveryListener);
+        mMdnsTransport.setMessageListener(msgListener);
+        mMdnsTransport.setPeerDiscoveryListener(discoveryListener);
+        mBleTransport.setMessageListener(msgListener);
+        mBleTransport.setPeerDiscoveryListener(discoveryListener);
 
-        // 4. Attempt to download all missing chunks
-        fillMissingChunksFromPeers(cm, discovery, cb, total);
-
-        // 5. CDN fallback for any still-missing chunks
-        if (mDownloadRunning.get()) {
-            fillMissingChunksFromCdn(cm, version, cb, total);
+        // Start transports (battery check inline)
+        if (mBatteryPct >= BATT_SUSPEND_MIN) {
+            mWifiTransport.start();
+            mMdnsTransport.start();
         }
+        mBleTransport.start(); // BLE advertising is low-power; always start
 
-        // 6. Check completion
-        if (!mDownloadRunning.get()) {
-            Slog.i(TAG, "runDownload: cancelled before completion");
-            return;
-        }
+        // Schedule periodic tasks
+        mHandler.postDelayed(mAnnounceRunnable, ANNOUNCE_INTERVAL_MS);
+        mHandler.postDelayed(mFlushRunnable, FLUSH_INTERVAL_MS);
+        mHandler.postDelayed(mPruneRunnable, PRUNE_INTERVAL_MS);
 
-        if (cm.isComplete()) {
-            assembleAndComplete(cm, cb);
-        } else {
-            int missing = cm.getMissingChunkIndices().size();
-            Slog.e(TAG, "runDownload: still missing " + missing + " chunks after all sources");
-            if (cb != null) cb.onFailed("Could not acquire " + missing + " chunks");
-        }
+        Log.i(TAG, "Mesh stack started, battery=" + mBatteryPct + "%");
     }
 
-    // -------------------------------------------------------------------------
-    // Peer-based acquisition
-    // -------------------------------------------------------------------------
+    public void stopMesh() {
+        if (!mRunning.compareAndSet(true, false)) return;
+        Log.i(TAG, "Stopping mesh stack");
 
-    /**
-     * Iterates over missing chunks and tries to download each one from
-     * a known peer. Updates progress every {@link #PROGRESS_INTERVAL} chunks.
-     */
-    private void fillMissingChunksFromPeers(ChunkManager cm,
-            PeerDiscovery discovery, MeshDownloadCallback cb, int total) {
-        if (!mDownloadRunning.get()) return;
+        mHandler.removeCallbacks(mAnnounceRunnable);
+        mHandler.removeCallbacks(mFlushRunnable);
+        mHandler.removeCallbacks(mPruneRunnable);
 
-        List<Integer> missing = cm.getMissingChunkIndices();
-        if (missing.isEmpty()) return;
-
-        Slog.i(TAG, "fillMissingChunksFromPeers: " + missing.size() + " chunks to fetch");
-
-        int acquired = 0;
-        for (int chunkIndex : missing) {
-            if (!mDownloadRunning.get()) break;
-
-            byte[] data = tryPeersForChunk(discovery, chunkIndex);
-            if (data != null) {
-                boolean saved = cm.saveChunk(chunkIndex, data);
-                if (saved) {
-                    acquired++;
-                    // Update our registration bitmap so new peers see our updated state
-                    discovery.registerSelf(/* version inferred from cm */ null,
-                            cm.getChunkBitmap());
-
-                    if (acquired % PROGRESS_INTERVAL == 0 && cb != null) {
-                        int have = countHave(cm);
-                        cb.onProgress(have, total);
-                    }
-                }
-            }
-        }
-
-        if (acquired > 0 && cb != null) {
-            cb.onProgress(countHave(cm), total);
-        }
+        if (mWifiTransport != null) mWifiTransport.stop();
+        if (mMdnsTransport != null) mMdnsTransport.stop();
+        if (mBleTransport  != null) mBleTransport.stop();
     }
 
+    // ── Public API ────────────────────────────────────────────────────────────
+
     /**
-     * Tries each known peer in turn for chunk {@code chunkIndex}.
+     * Sends a message to the specified device.
      *
-     * @return The raw chunk bytes if any peer provides it, otherwise null.
-     */
-    private byte[] tryPeersForChunk(PeerDiscovery discovery, int chunkIndex) {
-        // PeerDiscovery maintains its peer map internally; we ask ChunkClient
-        // to probe each one. Since PeerDiscovery does not expose a public peer
-        // list directly, we collect peer info from the last onPeerFound callbacks
-        // stored in our local list. In practice CircleMeshService drives this
-        // through the PeerListener, but for a clean API we use a separate
-        // snapshot field maintained below.
-        List<PeerDiscovery.PeerInfo> peers = getKnownPeers();
-        for (PeerDiscovery.PeerInfo peer : peers) {
-            if (!mDownloadRunning.get()) break;
-            // Only attempt if peer's bitmap indicates it has this chunk
-            byte[] bitmap = peer.chunkBitmap;
-            if (bitmap != null && chunkIndex < bitmap.length && bitmap[chunkIndex] == 0) {
-                continue; // Peer doesn't have it
-            }
-            byte[] data = ChunkClient.downloadChunk(peer, chunkIndex);
-            if (data != null && data.length > 0) {
-                Slog.d(TAG, "tryPeersForChunk: got chunk " + chunkIndex
-                        + " from peer " + peer.address);
-                return data;
-            }
-        }
-        return null;
-    }
-
-    // -------------------------------------------------------------------------
-    // CDN fallback
-    // -------------------------------------------------------------------------
-
-    /**
-     * Downloads any remaining missing chunks directly from the CDN via HTTP
-     * range requests.
+     * <p>If the recipient is not reachable, the message is stored for later delivery.
      *
-     * URL pattern: {@code CDN_BASE_URL}{version}/{chunkIndex:03d}.chunk
+     * @param recipientDeviceId 16-char hex target device ID.
+     * @param payload           Message payload bytes.
+     * @param msgType           Message type constant from {@link MeshProtocol}.
+     * @return true if the message was dispatched or queued.
      */
-    private void fillMissingChunksFromCdn(ChunkManager cm, String version,
-            MeshDownloadCallback cb, int total) {
-        List<Integer> missing = cm.getMissingChunkIndices();
-        if (missing.isEmpty()) return;
+    public boolean sendMessage(String recipientDeviceId, byte[] payload, int msgType) {
+        if (!mRunning.get()) {
+            Log.w(TAG, "sendMessage: mesh not running");
+            return false;
+        }
 
-        Slog.i(TAG, "fillMissingChunksFromCdn: " + missing.size() + " chunks via CDN");
+        String localId = mCrypto.getDeviceId();
+        byte[] senderIdBytes    = hexToBytes(localId, 8);
+        byte[] recipientIdBytes = hexToBytes(recipientDeviceId, 8);
+        byte[] msgIdBytes       = generateMessageId();
 
-        int acquired = 0;
-        for (int chunkIndex : missing) {
-            if (!mDownloadRunning.get()) break;
+        byte[] frame = MeshProtocol.buildFrame(
+                msgType, (byte) 0, (byte) 7, senderIdBytes, recipientIdBytes,
+                msgIdBytes, payload);
 
-            byte[] data = downloadChunkFromCdn(version, chunkIndex);
-            if (data != null) {
-                boolean saved = cm.saveChunk(chunkIndex, data);
-                if (saved) {
-                    acquired++;
-                    if (acquired % PROGRESS_INTERVAL == 0 && cb != null) {
-                        cb.onProgress(countHave(cm), total);
-                    }
+        if (frame == null) {
+            Log.e(TAG, "sendMessage: buildFrame returned null");
+            return false;
+        }
+
+        // Attempt immediate delivery
+        boolean sent = mRouter.route(recipientDeviceId, frame);
+        if (!sent) {
+            // Store for later
+            String msgId = MeshCrypto.bytesToHex(msgIdBytes);
+            mMessageStore.storeMessage(msgId, recipientDeviceId, msgType, frame);
+            Log.d(TAG, "sendMessage: queued for later delivery, msgId=" + msgId);
+        }
+        return true;
+    }
+
+    /** Returns the current peer count. */
+    public int getPeerCount() { return mPeerManager.getPeerCount(); }
+
+    /** Returns the local rotating device ID (16-char hex). */
+    public String getDeviceId() { return mCrypto.getDeviceId(); }
+
+    /** Returns true if the mesh stack is running. */
+    public boolean isRunning() { return mRunning.get(); }
+
+    // ── Transport dispatch ────────────────────────────────────────────────────
+
+    /**
+     * Selects the best available transport for a peer and sends the frame.
+     * Implements {@link MeshRouter.TransportSender}.
+     */
+    private boolean dispatchToPeer(PeerManager.PeerInfo peer, byte[] frame) {
+        // Relay requires battery >= 50% (when the message is for someone else)
+        // Direct sends are always allowed if battery >= 20%
+        if (mBatteryPct < BATT_SUSPEND_MIN) {
+            Log.d(TAG, "dispatchToPeer: battery critical, dropping non-urgent frame");
+            return false;
+        }
+
+        String address = peer.address + ":" + peer.port;
+
+        switch (peer.transport) {
+            case MeshTransport.TYPE_WIFI_DIRECT:
+                return mWifiTransport != null && mWifiTransport.isActive()
+                        && mWifiTransport.send(address, frame);
+            case MeshTransport.TYPE_MDNS:
+                return mMdnsTransport != null && mMdnsTransport.isActive()
+                        && mMdnsTransport.send(address, frame);
+            case MeshTransport.TYPE_BT_LE:
+                // BLE is discovery-only; fall through to WiFi/mDNS for data
+                Log.d(TAG, "dispatchToPeer: BLE peer — trying WiFi fallback");
+                if (mWifiTransport != null && mWifiTransport.isActive()) {
+                    return mWifiTransport.send(peer.address + ":" + WifiDirectTransport.MESH_PORT, frame);
                 }
-            }
-        }
-
-        if (acquired > 0 && cb != null) {
-            cb.onProgress(countHave(cm), total);
+                return false;
+            default:
+                Log.w(TAG, "dispatchToPeer: unknown transport " + peer.transport);
+                return false;
         }
     }
 
+    // ── Message delivery ──────────────────────────────────────────────────────
+
     /**
-     * Fetches a single chunk from the CDN.
-     *
-     * @param version    OTA version string.
-     * @param chunkIndex Zero-based chunk index.
-     * @return Raw chunk bytes, or null on failure.
+     * Called by {@link MeshRouter} when a frame addressed to us arrives.
      */
-    private byte[] downloadChunkFromCdn(String version, int chunkIndex) {
-        String url = CDN_BASE_URL + sanitizeVersion(version)
-                + "/" + String.format("%03d", chunkIndex) + ".chunk";
-        Slog.d(TAG, "CDN fetch: " + url);
+    private void onMessageDelivered(MeshProtocol.Message msg, String from) {
+        Log.i(TAG, "Message delivered: type=0x" + Integer.toHexString(msg.type)
+                + " from=" + msg.getSenderHex() + " via=" + from);
+        // TODO: dispatch to per-capability handlers (OTA, MSG, TX, FILE, Butler)
+    }
 
-        HttpURLConnection conn = null;
-        try {
-            conn = (HttpURLConnection) new URL(url).openConnection();
-            conn.setConnectTimeout(CDN_CONNECT_TIMEOUT_MS);
-            conn.setReadTimeout(CDN_READ_TIMEOUT_MS);
-            conn.setRequestMethod("GET");
+    // ── Store-and-forward flush ───────────────────────────────────────────────
 
-            int code = conn.getResponseCode();
-            if (code != HttpURLConnection.HTTP_OK) {
-                Slog.w(TAG, "CDN fetch: HTTP " + code + " for " + url);
-                return null;
+    /** Attempts to deliver all queued messages for a given peer. */
+    private void flushStoredMessages(String deviceId) {
+        List<MessageStore.StoredMessage> pending = mMessageStore.getPendingFor(deviceId);
+        if (pending.isEmpty()) return;
+        Log.d(TAG, "flushStoredMessages: " + pending.size() + " queued for " + deviceId);
+
+        for (MessageStore.StoredMessage sm : pending) {
+            boolean sent = mRouter.route(deviceId, sm.payload);
+            if (sent) {
+                mMessageStore.markDelivered(sm.rowId);
+                Log.d(TAG, "Delivered stored msg " + sm.msgId + " to " + deviceId);
+            } else {
+                mMessageStore.incrementAttempts(sm.rowId);
             }
+        }
+    }
 
-            int contentLen = conn.getContentLength();
-            try (InputStream in = conn.getInputStream()) {
-                if (contentLen > 0) {
-                    byte[] buf = new byte[contentLen];
-                    int offset = 0;
-                    while (offset < contentLen) {
-                        int n = in.read(buf, offset, contentLen - offset);
-                        if (n < 0) break;
-                        offset += n;
-                    }
-                    return buf;
-                } else {
-                    // Unknown content length — read until EOF
-                    java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
-                    byte[] tmp = new byte[65536];
-                    int n;
-                    while ((n = in.read(tmp)) > 0) baos.write(tmp, 0, n);
-                    return baos.toByteArray();
+    // ── Periodic runnables ────────────────────────────────────────────────────
+
+    private final Runnable mAnnounceRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mRunning.get()) return;
+            sendAnnounce();
+            mHandler.postDelayed(this, ANNOUNCE_INTERVAL_MS);
+        }
+    };
+
+    private final Runnable mFlushRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mRunning.get()) return;
+            for (PeerManager.PeerInfo peer : mPeerManager.getDirectPeers()) {
+                flushStoredMessages(peer.deviceId);
+            }
+            mHandler.postDelayed(this, FLUSH_INTERVAL_MS);
+        }
+    };
+
+    private final Runnable mPruneRunnable = new Runnable() {
+        @Override
+        public void run() {
+            if (!mRunning.get()) return;
+            mMessageStore.pruneOld();
+            mHandler.postDelayed(this, PRUNE_INTERVAL_MS);
+        }
+    };
+
+    // ── Announce ──────────────────────────────────────────────────────────────
+
+    private void sendAnnounce() {
+        String localId = mCrypto.getDeviceId();
+        byte[] senderId = hexToBytes(localId, 8);
+        byte[] bcastId  = new byte[8]; // all zeros = broadcast
+        byte[] msgId    = generateMessageId();
+
+        // ANNOUNCE payload: just the DER-encoded public key
+        byte[] pubKey = mCrypto.getPublicKeyBytes();
+        byte[] frame = MeshProtocol.buildFrame(
+                MeshProtocol.TYPE_ANNOUNCE, MeshProtocol.FLAG_BROADCAST, (byte) 3,
+                senderId, bcastId, msgId, pubKey);
+
+        if (frame != null) {
+            if (mWifiTransport != null && mWifiTransport.isActive()) {
+                mWifiTransport.announce(frame);
+            }
+            if (mMdnsTransport != null && mMdnsTransport.isActive()) {
+                mMdnsTransport.announce(frame);
+            }
+            if (mBleTransport != null && mBleTransport.isActive()) {
+                mBleTransport.announce(frame);
+            }
+        }
+    }
+
+    // ── Battery monitoring ────────────────────────────────────────────────────
+
+    private void registerBatteryReceiver() {
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                int level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, 100);
+                int scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
+                int pct   = (scale > 0) ? (level * 100 / scale) : 100;
+                onBatteryChanged(pct);
+            }
+        };
+        getContext().registerReceiver(receiver,
+                new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+    }
+
+    private void onBatteryChanged(int pct) {
+        int prev = mBatteryPct;
+        mBatteryPct = pct;
+
+        if (prev >= BATT_SUSPEND_MIN && pct < BATT_SUSPEND_MIN) {
+            Log.w(TAG, "Battery critical (" + pct + "%) — suspending data transports");
+            mHandler.post(() -> {
+                if (mWifiTransport != null) mWifiTransport.stop();
+                if (mMdnsTransport != null) mMdnsTransport.stop();
+            });
+        } else if (prev < BATT_SUSPEND_MIN && pct >= BATT_SUSPEND_MIN) {
+            Log.i(TAG, "Battery recovered (" + pct + "%) — restarting data transports");
+            mHandler.post(() -> {
+                if (mRunning.get()) {
+                    if (mWifiTransport != null) mWifiTransport.start();
+                    if (mMdnsTransport != null) mMdnsTransport.start();
                 }
-            }
-        } catch (IOException e) {
-            Slog.w(TAG, "CDN fetch failed for chunk " + chunkIndex + ": " + e.getMessage());
-            return null;
-        } finally {
-            if (conn != null) conn.disconnect();
+            });
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Assembly and completion
-    // -------------------------------------------------------------------------
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private void assembleAndComplete(ChunkManager cm, MeshDownloadCallback cb) {
-        Slog.i(TAG, "assembleAndComplete: all chunks present, assembling");
-        try {
-            File assembled = cm.getCompletedFile();
-            Slog.i(TAG, "assembleAndComplete: success, path=" + assembled.getAbsolutePath());
-            if (cb != null) cb.onComplete(assembled);
-        } catch (IOException e) {
-            Slog.e(TAG, "assembleAndComplete: assembly failed", e);
-            if (cb != null) cb.onFailed("Assembly/verification failed: " + e.getMessage());
-        } finally {
-            // Tear down peers and server — we're done
-            PeerDiscovery pd = mPeerDiscovery;
-            if (pd != null) pd.stopDiscovery();
-            ChunkServer cs = mChunkServer;
-            if (cs != null) cs.stop();
+    /** Converts a hex string to a byte array of exactly {@code len} bytes. */
+    private static byte[] hexToBytes(String hex, int len) {
+        byte[] result = new byte[len];
+        if (hex == null) return result;
+        int hexLen = Math.min(hex.length() / 2, len);
+        for (int i = 0; i < hexLen; i++) {
+            result[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
         }
+        return result;
     }
 
-    // -------------------------------------------------------------------------
-    // Peer list management
-    // -------------------------------------------------------------------------
-
-    /**
-     * In-memory list of currently known peers, updated by PeerListener callbacks.
-     * Guarded by {@code mKnownPeers}.
-     */
-    private final java.util.concurrent.CopyOnWriteArrayList<PeerDiscovery.PeerInfo>
-            mKnownPeers = new java.util.concurrent.CopyOnWriteArrayList<>();
-
-    /**
-     * Returns a snapshot of currently known peers.
-     */
-    private List<PeerDiscovery.PeerInfo> getKnownPeers() {
-        return mKnownPeers;
-    }
-
-    /**
-     * Updates the known-peer list. Called from the PeerListener (on the
-     * discovery thread) via the Handler.
-     */
-    private void onPeerFoundInternal(PeerDiscovery.PeerInfo peer) {
-        // Replace existing entry by ID (IP address)
-        mKnownPeers.removeIf(p -> p.id.equals(peer.id));
-        mKnownPeers.add(peer);
-    }
-
-    private void onPeerLostInternal(String peerId) {
-        mKnownPeers.removeIf(p -> p.id.equals(peerId));
-    }
-
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-
-    /** Returns how many chunks are currently held in the given manager. */
-    private static int countHave(ChunkManager cm) {
-        int have = 0;
-        byte[] bitmap = cm.getChunkBitmap();
-        for (byte b : bitmap) if (b == 0x01) have++;
-        return have;
-    }
-
-    private static String sanitizeVersion(String version) {
-        if (version == null) return "unknown";
-        return version.replaceAll("[^a-zA-Z0-9._-]", "_");
+    /** Generates a random 16-byte message ID. */
+    private static byte[] generateMessageId() {
+        byte[] id = new byte[16];
+        java.util.concurrent.ThreadLocalRandom.current().nextBytes(id);
+        return id;
     }
 }
