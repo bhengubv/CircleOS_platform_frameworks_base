@@ -6,6 +6,7 @@
 package com.circleos.server.update;
 
 import android.content.Context;
+import android.os.Build;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
@@ -59,6 +60,7 @@ public class CircleUpdateService extends SystemService {
     private Handler       mHandler;
 
     private UpdateChecker             mChecker;
+    private DeltaChecker              mDeltaChecker;
     private UpdateDownloader          mDownloader;
     private MeshOtaDownloader        mMeshDownloader;
     private UpdateInstaller           mInstaller;
@@ -94,10 +96,21 @@ public class CircleUpdateService extends SystemService {
         mHandler = new Handler(mHandlerThread.getLooper());
 
         mChecker        = new UpdateChecker(getContext());
+        mDeltaChecker   = new DeltaChecker();
         mDownloader     = new UpdateDownloader(getContext());
         mMeshDownloader = new MeshOtaDownloader(getContext());
         mInstaller      = new UpdateInstaller(getContext());
         mNotifManager   = new UpdateNotificationManager(getContext());
+
+        // Log A/B slot state at startup
+        AbSlotManager.logSlotState();
+
+        // Detect and clear any stuck update from a previous run
+        String stuck = AbSlotManager.checkForStuckUpdate();
+        if (stuck != null) {
+            Log.w(TAG, "Previous update to v" + stuck + " appears stuck — clearing record");
+            AbSlotManager.clearUpdateRecord();
+        }
 
         // Ensure update directory exists
         new File(UPDATE_DIR).mkdirs();
@@ -198,47 +211,86 @@ public class CircleUpdateService extends SystemService {
         mDownloadProgress = 0;
         mNotifManager.showDownloading(0);
 
-        // Determine active channel for mesh manifest query
         final String channel = (mChannelOverride != null)
                 ? mChannelOverride
                 : SystemProperties.get("ro.circleos.channel", "stable");
+        final String currentVersion = Build.VERSION.RELEASE;
 
         mHandler.post(() -> {
             File downloaded = null;
 
-            // ── Phase 4: attempt mesh P2P chunk delivery first ────────────────
-            if (isMeshAvailable()) {
-                Log.i(TAG, "Mesh is active — attempting mesh chunk delivery for v"
-                        + info.version);
+            // ── Check for delta package (smaller download) ─────────────────────
+            DeltaChecker.DeltaInfo delta =
+                    mDeltaChecker.checkDelta(currentVersion, info.version, channel);
+
+            if (delta != null) {
+                Log.i(TAG, "Delta available: " + delta);
+
+                // Priority 1: delta via mesh
+                if (isMeshAvailable()) {
+                    Log.i(TAG, "Trying delta via mesh");
+                    try {
+                        downloaded = mMeshDownloader.downloadDelta(
+                                delta.fromVersion, delta.toVersion, channel,
+                                percent -> {
+                                    mDownloadProgress = percent;
+                                    mNotifManager.showDownloading(percent);
+                                });
+                        Log.i(TAG, "Mesh delta delivery succeeded");
+                    } catch (Exception e) {
+                        Log.w(TAG, "Mesh delta failed: " + e.getMessage());
+                        downloaded = null;
+                    }
+                }
+
+                // Priority 2: delta via CDN (direct download via DownloadManager)
+                if (downloaded == null) {
+                    Log.i(TAG, "Trying delta via CDN: " + delta.deltaUrl);
+                    try {
+                        downloaded = mDownloader.download(
+                                delta.deltaUrl, info.version + "-delta",
+                                percent -> {
+                                    mDownloadProgress = percent;
+                                    mNotifManager.showDownloading(percent);
+                                });
+                        Log.i(TAG, "CDN delta download succeeded");
+                    } catch (Exception e) {
+                        Log.w(TAG, "CDN delta failed: " + e.getMessage()
+                                + " — will try full package");
+                        downloaded = null;
+                    }
+                }
+            }
+
+            // ── Priority 3: full package via mesh ─────────────────────────────
+            if (downloaded == null && isMeshAvailable()) {
+                Log.i(TAG, "Trying full OTA via mesh for v" + info.version);
                 try {
                     downloaded = mMeshDownloader.download(
-                            info.version,
-                            channel,
+                            info.version, channel,
                             percent -> {
                                 mDownloadProgress = percent;
                                 mNotifManager.showDownloading(percent);
                             });
-                    Log.i(TAG, "Mesh delivery succeeded: " + downloaded.getAbsolutePath());
+                    Log.i(TAG, "Mesh full delivery succeeded");
                 } catch (Exception e) {
-                    Log.w(TAG, "Mesh delivery failed, falling back to direct CDN: "
-                            + e.getMessage());
+                    Log.w(TAG, "Mesh full delivery failed: " + e.getMessage());
                     downloaded = null;
                 }
             }
 
-            // ── Fallback: direct CDN download via DownloadManager ─────────────
+            // ── Priority 4: full package via CDN (DownloadManager) ────────────
             if (downloaded == null) {
                 Log.i(TAG, "Using direct CDN download for v" + info.version);
                 try {
                     downloaded = mDownloader.download(
-                            info.manifestUrl,
-                            info.version,
+                            info.manifestUrl, info.version,
                             percent -> {
                                 mDownloadProgress = percent;
                                 mNotifManager.showDownloading(percent);
                             });
                 } catch (Exception e) {
-                    Log.e(TAG, "CDN download failed", e);
+                    Log.e(TAG, "All download strategies failed", e);
                     mDownloadProgress = -1;
                     setState(UpdateState.FAILED);
                     mNotifManager.showFailed(e.getMessage() != null
@@ -282,6 +334,8 @@ public class CircleUpdateService extends SystemService {
 
         setState(UpdateState.INSTALLING);
         mNotifManager.cancel();
+        // Record update start for stuck-update detection on next boot
+        AbSlotManager.recordUpdateStart(mAvailableVersion);
         // Stop serving chunks to peers — we're about to install
         mMeshDownloader.stopChunkServer();
 

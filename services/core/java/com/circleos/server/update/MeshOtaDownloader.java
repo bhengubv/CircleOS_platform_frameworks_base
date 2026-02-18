@@ -170,8 +170,9 @@ public class MeshOtaDownloader {
     // ── Public entry point ────────────────────────────────────────────────────
 
     /**
-     * Downloads the OTA package for {@code version} from the mesh + CDN, assembles
-     * it, verifies the SHA-256 hash and returns the ready-to-install {@link File}.
+     * Downloads the full OTA package for {@code version} from the mesh + CDN,
+     * assembles it, verifies the SHA-256 hash and returns the ready-to-install
+     * {@link File}.
      *
      * <p>Blocks the calling thread until complete or an exception is thrown.
      *
@@ -183,10 +184,35 @@ public class MeshOtaDownloader {
      */
     public File download(String version, String channel, ProgressCallback callback)
             throws IOException {
+        return downloadInternal(version, channel, "full", callback);
+    }
+
+    /**
+     * Downloads a <em>delta</em> OTA package that upgrades from {@code fromVersion}
+     * to {@code toVersion}.  Uses the same mesh-first + CDN-fallback strategy as
+     * {@link #download(String, String, ProgressCallback)}.
+     *
+     * @param fromVersion Current OS version on the device.
+     * @param toVersion   Target version to upgrade to.
+     * @param channel     Release channel.
+     * @param callback    Optional progress listener.
+     * @return Assembled delta OTA zip {@link File}.
+     * @throws IOException on any unrecoverable error.
+     */
+    public File downloadDelta(String fromVersion, String toVersion, String channel,
+            ProgressCallback callback) throws IOException {
+        return downloadInternal(toVersion, channel, "delta_" + fromVersion, callback);
+    }
+
+    // ── Shared download implementation ────────────────────────────────────────
+
+    private File downloadInternal(String version, String channel, String packageType,
+            ProgressCallback callback) throws IOException {
 
         // 1. Fetch chunk manifest
-        Log.i(TAG, "Fetching chunk manifest for v" + version + " [" + channel + "]");
-        ChunkManifest manifest = fetchManifest(version, channel);
+        Log.i(TAG, "Fetching chunk manifest for v" + version + " pkg=" + packageType
+                + " [" + channel + "]");
+        ChunkManifest manifest = fetchManifest(version, channel, packageType);
         Log.i(TAG, "Manifest: " + manifest.chunkCount + " chunks, total "
                 + manifest.totalSize + " bytes");
 
@@ -199,7 +225,9 @@ public class MeshOtaDownloader {
         if (!updateDir.exists() && !updateDir.mkdirs()) {
             throw new IOException("Cannot create update dir: " + UPDATE_DIR);
         }
-        String safeName = "circleos_mesh_" + version.replaceAll("[^a-zA-Z0-9._-]", "_") + ".zip";
+        String safeVer  = version.replaceAll("[^a-zA-Z0-9._-]", "_");
+        String safePkg  = packageType.replaceAll("[^a-zA-Z0-9._-]", "_");
+        String safeName = "circleos_mesh_" + safeVer + "_" + safePkg + ".zip";
         File destFile = new File(updateDir, safeName);
 
         // Pre-allocate the file to totalSize
@@ -283,9 +311,10 @@ public class MeshOtaDownloader {
 
     // ── Manifest fetch ────────────────────────────────────────────────────────
 
-    private ChunkManifest fetchManifest(String version, String channel) throws IOException {
+    private ChunkManifest fetchManifest(String version, String channel,
+            String packageType) throws IOException {
         String urlStr = API_BASE_URL + "/api/os/releases/" + version
-                + "/chunks?channel=" + channel + "&package=full";
+                + "/chunks?channel=" + channel + "&package=" + packageType;
         Log.d(TAG, "GET " + urlStr);
         HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
         conn.setConnectTimeout(15_000);
