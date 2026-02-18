@@ -198,6 +198,7 @@ public class ModelManager {
                 m.id              = o.optString("modelId", "unknown");
                 m.name            = o.optString("name", m.id);
                 m.sizeBytes       = o.optLong("sizeBytes", 0);
+                m.parameterCount  = o.optLong("parameterCount", 0);
                 m.minRamMb        = o.optInt("minRamMb", 0);
                 m.recommendedTier = o.optInt("recommendedTier", 1);
                 m.backend         = o.optString("backend", "llama.cpp");
