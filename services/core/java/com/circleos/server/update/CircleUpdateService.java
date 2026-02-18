@@ -15,6 +15,7 @@ import android.util.Log;
 
 import com.android.server.SystemService;
 
+import za.co.circleos.mesh.ICircleMeshService;
 import za.co.circleos.update.ICircleUpdateService;
 
 import org.json.JSONObject;
@@ -59,6 +60,7 @@ public class CircleUpdateService extends SystemService {
 
     private UpdateChecker             mChecker;
     private UpdateDownloader          mDownloader;
+    private MeshOtaDownloader        mMeshDownloader;
     private UpdateInstaller           mInstaller;
     private UpdateNotificationManager mNotifManager;
     private UpdateScheduler.UpdateCheckReceiver mCheckReceiver;
@@ -91,10 +93,11 @@ public class CircleUpdateService extends SystemService {
         mHandlerThread.start();
         mHandler = new Handler(mHandlerThread.getLooper());
 
-        mChecker      = new UpdateChecker(getContext());
-        mDownloader   = new UpdateDownloader(getContext());
-        mInstaller    = new UpdateInstaller(getContext());
-        mNotifManager = new UpdateNotificationManager(getContext());
+        mChecker        = new UpdateChecker(getContext());
+        mDownloader     = new UpdateDownloader(getContext());
+        mMeshDownloader = new MeshOtaDownloader(getContext());
+        mInstaller      = new UpdateInstaller(getContext());
+        mNotifManager   = new UpdateNotificationManager(getContext());
 
         // Ensure update directory exists
         new File(UPDATE_DIR).mkdirs();
@@ -195,30 +198,77 @@ public class CircleUpdateService extends SystemService {
         mDownloadProgress = 0;
         mNotifManager.showDownloading(0);
 
+        // Determine active channel for mesh manifest query
+        final String channel = (mChannelOverride != null)
+                ? mChannelOverride
+                : SystemProperties.get("ro.circleos.channel", "stable");
+
         mHandler.post(() -> {
-            try {
-                File downloaded = mDownloader.download(
-                        info.manifestUrl,
-                        info.version,
-                        percent -> {
-                            mDownloadProgress = percent;
-                            mNotifManager.showDownloading(percent);
-                        });
+            File downloaded = null;
 
-                mDownloadedFile = downloaded;
-                mDownloadProgress = 100;
-                setState(UpdateState.READY_TO_INSTALL);
-                mNotifManager.showReadyToInstall(info.version);
-                Log.i(TAG, "Download complete: " + downloaded.getAbsolutePath());
-
-            } catch (Exception e) {
-                Log.e(TAG, "Download failed", e);
-                mDownloadProgress = -1;
-                setState(UpdateState.FAILED);
-                mNotifManager.showFailed(e.getMessage() != null
-                        ? e.getMessage() : "Download error");
+            // ── Phase 4: attempt mesh P2P chunk delivery first ────────────────
+            if (isMeshAvailable()) {
+                Log.i(TAG, "Mesh is active — attempting mesh chunk delivery for v"
+                        + info.version);
+                try {
+                    downloaded = mMeshDownloader.download(
+                            info.version,
+                            channel,
+                            percent -> {
+                                mDownloadProgress = percent;
+                                mNotifManager.showDownloading(percent);
+                            });
+                    Log.i(TAG, "Mesh delivery succeeded: " + downloaded.getAbsolutePath());
+                } catch (Exception e) {
+                    Log.w(TAG, "Mesh delivery failed, falling back to direct CDN: "
+                            + e.getMessage());
+                    downloaded = null;
+                }
             }
+
+            // ── Fallback: direct CDN download via DownloadManager ─────────────
+            if (downloaded == null) {
+                Log.i(TAG, "Using direct CDN download for v" + info.version);
+                try {
+                    downloaded = mDownloader.download(
+                            info.manifestUrl,
+                            info.version,
+                            percent -> {
+                                mDownloadProgress = percent;
+                                mNotifManager.showDownloading(percent);
+                            });
+                } catch (Exception e) {
+                    Log.e(TAG, "CDN download failed", e);
+                    mDownloadProgress = -1;
+                    setState(UpdateState.FAILED);
+                    mNotifManager.showFailed(e.getMessage() != null
+                            ? e.getMessage() : "Download error");
+                    return;
+                }
+            }
+
+            mDownloadedFile = downloaded;
+            mDownloadProgress = 100;
+            setState(UpdateState.READY_TO_INSTALL);
+            mNotifManager.showReadyToInstall(info.version);
+            Log.i(TAG, "Download complete: " + downloaded.getAbsolutePath());
         });
+    }
+
+    /**
+     * Returns true when the CircleMeshService is reachable and reports at least
+     * one peer — a prerequisite for useful mesh chunk delivery.
+     */
+    private boolean isMeshAvailable() {
+        try {
+            IBinder binder = ServiceManager.getService("circle.mesh");
+            if (binder == null) return false;
+            ICircleMeshService mesh = ICircleMeshService.Stub.asInterface(binder);
+            return mesh.isRunning() && mesh.getPeerCount() > 0;
+        } catch (Exception e) {
+            Log.d(TAG, "Mesh availability check failed: " + e.getMessage());
+            return false;
+        }
     }
 
     private void applyUpdateInternal() {
@@ -232,6 +282,8 @@ public class CircleUpdateService extends SystemService {
 
         setState(UpdateState.INSTALLING);
         mNotifManager.cancel();
+        // Stop serving chunks to peers — we're about to install
+        mMeshDownloader.stopChunkServer();
 
         mHandler.post(() -> {
             try {
