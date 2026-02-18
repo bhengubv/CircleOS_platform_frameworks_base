@@ -14,15 +14,24 @@ import za.co.circleos.security.DmzAnalysisResult;
 import za.co.circleos.security.ICircleQuarantine;
 import za.co.circleos.security.QuarantineRecord;
 
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.PrintWriter;
 import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * Circle Malware Jail — Quarantine Manager.
@@ -41,11 +50,13 @@ public class QuarantineManager extends SystemService {
     public  static final String SERVICE_NAME = "circle.quarantine";
     public  static final int    VERSION      = 1;
 
-    private static final String QUARANTINE_DIR = "/data/circle/security/quarantine/";
+    private static final String QUARANTINE_DIR  = "/data/circle/security/quarantine/";
+    private static final String INDEX_FILE      = QUARANTINE_DIR + "index.jsonl";
 
     private final BinderService mBinderService = new BinderService();
     private final ConcurrentHashMap<String, QuarantineRecord> mRecords
             = new ConcurrentHashMap<>();
+    private final ReentrantLock mPersistLock = new ReentrantLock();
     private ResearcherApiService mResearcherApi;
 
     /* ── Lifecycle ─────────────────────────────────────────────────────── */
@@ -141,6 +152,7 @@ public class QuarantineManager extends SystemService {
             QuarantineRecord r = mRecords.remove(quarantineId);
             if (r == null) return false;
             deleteFiles(quarantineId);
+            rewriteIndex();
             return true;
         }
 
@@ -148,6 +160,7 @@ public class QuarantineManager extends SystemService {
         public void deleteAll() {
             for (String id : mRecords.keySet()) deleteFiles(id);
             mRecords.clear();
+            rewriteIndex();
         }
 
         @Override
@@ -278,14 +291,132 @@ public class QuarantineManager extends SystemService {
         }
     }
 
-    private void persistRecord(QuarantineRecord r) {
-        // Phase 2: append to /data/circle/security/quarantine/index.jsonl
-        // Phase 3: SQLite
-        Log.d(TAG, "Record persisted: " + r.quarantineId);
+    /**
+     * Rewrites the entire index.jsonl from the current in-memory map.
+     * Called after deletions to keep the file consistent.
+     */
+    private void rewriteIndex() {
+        mPersistLock.lock();
+        try {
+            try (FileWriter fw = new FileWriter(INDEX_FILE, /*append=*/false);
+                 PrintWriter pw = new PrintWriter(fw)) {
+                for (QuarantineRecord r : mRecords.values()) {
+                    try {
+                        pw.println(recordToJson(r).toString());
+                    } catch (JSONException e) {
+                        Log.w(TAG, "rewriteIndex: skipping " + r.quarantineId, e);
+                    }
+                }
+            } catch (IOException e) {
+                Log.e(TAG, "rewriteIndex: write failed", e);
+            }
+        } finally {
+            mPersistLock.unlock();
+        }
     }
 
+    /**
+     * Appends a single record as a JSON line to index.jsonl.
+     * Thread-safe via mPersistLock; called on the caller thread.
+     */
+    private void persistRecord(QuarantineRecord r) {
+        mPersistLock.lock();
+        try {
+            JSONObject o = recordToJson(r);
+            try (FileWriter fw = new FileWriter(INDEX_FILE, /*append=*/true);
+                 PrintWriter pw = new PrintWriter(fw)) {
+                pw.println(o.toString());
+            } catch (IOException e) {
+                Log.e(TAG, "persistRecord: write failed for " + r.quarantineId, e);
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "persistRecord: JSON error for " + r.quarantineId, e);
+        } finally {
+            mPersistLock.unlock();
+        }
+    }
+
+    /**
+     * Reads index.jsonl on startup and re-populates mRecords.
+     * Skips malformed lines with a warning rather than failing.
+     */
     private void loadRecords() {
-        // Phase 2: read index.jsonl on startup
-        Log.d(TAG, "Quarantine records loaded from disk");
+        File f = new File(INDEX_FILE);
+        if (!f.exists()) {
+            Log.d(TAG, "loadRecords: index.jsonl not present — fresh start");
+            return;
+        }
+        int loaded = 0, skipped = 0;
+        try (BufferedReader br = new BufferedReader(new FileReader(f))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) continue;
+                try {
+                    QuarantineRecord r = recordFromJson(new JSONObject(line));
+                    if (r.quarantineId != null && !r.quarantineId.isEmpty()) {
+                        mRecords.put(r.quarantineId, r);
+                        loaded++;
+                    }
+                } catch (JSONException je) {
+                    Log.w(TAG, "loadRecords: skipping malformed line: " + line, je);
+                    skipped++;
+                }
+            }
+        } catch (IOException e) {
+            Log.e(TAG, "loadRecords: read failed", e);
+        }
+        Log.i(TAG, "loadRecords: loaded=" + loaded + " skipped=" + skipped);
+    }
+
+    /** Serialises a QuarantineRecord to a JSONObject. */
+    private static JSONObject recordToJson(QuarantineRecord r) throws JSONException {
+        JSONObject o = new JSONObject();
+        o.put("quarantineId",   r.quarantineId);
+        o.put("originalPath",   r.originalPath  != null ? r.originalPath  : "");
+        o.put("fileName",       r.fileName      != null ? r.fileName      : "");
+        o.put("mimeType",       r.mimeType      != null ? r.mimeType      : "");
+        o.put("sourceApp",      r.sourceApp     != null ? r.sourceApp     : "");
+        o.put("sha256",         r.sha256        != null ? r.sha256        : "");
+        o.put("threatClass",    r.threatClass);
+        o.put("threatName",     r.threatName    != null ? r.threatName    : "");
+        o.put("quarantinedAt",  r.quarantinedAt);
+        o.put("fileSizeBytes",  r.fileSizeBytes);
+        o.put("submittedToFeed",r.submittedToFeed);
+        o.put("restoredAt",     r.restoredAt);
+        o.put("restoredTo",     r.restoredTo    != null ? r.restoredTo    : "");
+
+        JSONArray iocs = new JSONArray();
+        if (r.iocExtracted != null) {
+            for (String ioc : r.iocExtracted) iocs.put(ioc);
+        }
+        o.put("iocExtracted", iocs);
+        return o;
+    }
+
+    /** Deserialises a QuarantineRecord from a JSONObject. */
+    private static QuarantineRecord recordFromJson(JSONObject o) throws JSONException {
+        QuarantineRecord r = new QuarantineRecord();
+        r.quarantineId   = o.optString("quarantineId");
+        r.originalPath   = o.optString("originalPath");
+        r.fileName       = o.optString("fileName");
+        r.mimeType       = o.optString("mimeType");
+        r.sourceApp      = o.optString("sourceApp");
+        r.sha256         = o.optString("sha256");
+        r.threatClass    = o.optInt("threatClass", QuarantineRecord.CLASS_PUA);
+        r.threatName     = o.optString("threatName");
+        r.quarantinedAt  = o.optLong("quarantinedAt");
+        r.fileSizeBytes  = o.optLong("fileSizeBytes");
+        r.submittedToFeed= o.optBoolean("submittedToFeed");
+        r.restoredAt     = o.optLong("restoredAt");
+        r.restoredTo     = o.optString("restoredTo");
+
+        JSONArray iocs = o.optJSONArray("iocExtracted");
+        if (iocs != null) {
+            for (int i = 0; i < iocs.length(); i++) {
+                r.iocExtracted.add(iocs.optString(i));
+            }
+        }
+        return r;
     }
 }
