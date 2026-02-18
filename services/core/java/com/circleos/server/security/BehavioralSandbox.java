@@ -463,7 +463,22 @@ public class BehavioralSandbox {
                      + ((ipHex >> 16) & 0xFF) + "." + ((ipHex >> 24) & 0xFF)
                      + ":" + port;
             }
-            return null; // IPv6 not decoded here
+            // IPv6 — /proc/net/tcp6 encodes as 4 little-endian 32-bit words (32 hex chars)
+            if (parts[0].length() == 32) {
+                StringBuilder sb = new StringBuilder();
+                for (int i = 0; i < 32; i += 8) {
+                    long word = Long.parseLong(parts[0].substring(i, i + 8), 16);
+                    // reverse byte order within each 32-bit word
+                    int b0 = (int)(word & 0xFF);
+                    int b1 = (int)((word >> 8) & 0xFF);
+                    int b2 = (int)((word >> 16) & 0xFF);
+                    int b3 = (int)((word >> 24) & 0xFF);
+                    if (sb.length() > 0) sb.append(':');
+                    sb.append(String.format("%02x%02x:%02x%02x", b0, b1, b2, b3));
+                }
+                return sb.toString() + ":" + port;
+            }
+            return null;
         } catch (Exception e) { return null; }
     }
 

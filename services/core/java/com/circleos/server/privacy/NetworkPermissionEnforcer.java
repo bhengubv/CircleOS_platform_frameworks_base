@@ -239,13 +239,32 @@ public class NetworkPermissionEnforcer {
         }
     }
 
+    private static final long NETD_RETRY_DELAY_MS = 5_000L;
+    private static final int  NETD_RETRY_MAX      = 12; // up to 60 s
+    private int               mNetdRetryCount     = 0;
+
     private void connectToNetd() {
         IBinder b = ServiceManager.getService("netd");
         if (b != null) {
             mNetd = INetd.Stub.asInterface(b);
+            mNetdRetryCount = 0;
+            Slog.i(TAG, "Connected to netd — reapplying grants");
+            reapplyAllGrants();
         } else {
-            Slog.w(TAG, "netd not yet available; will retry on demand");
+            scheduleNetdRetry();
         }
+    }
+
+    private void scheduleNetdRetry() {
+        if (mNetdRetryCount >= NETD_RETRY_MAX) {
+            Slog.e(TAG, "netd unavailable after " + NETD_RETRY_MAX + " retries — giving up");
+            return;
+        }
+        mNetdRetryCount++;
+        long delay = NETD_RETRY_DELAY_MS * mNetdRetryCount;
+        Slog.w(TAG, "netd not yet available; retry " + mNetdRetryCount
+                + "/" + NETD_RETRY_MAX + " in " + (delay / 1000) + "s");
+        mHandler.postDelayed(this::connectToNetd, delay);
     }
 
     /** Auto-deny newly installed apps. */
