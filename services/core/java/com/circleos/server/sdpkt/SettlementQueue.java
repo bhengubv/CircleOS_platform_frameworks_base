@@ -4,11 +4,19 @@
  */
 package com.circleos.server.sdpkt;
 
-import android.os.Handler;
+import android.os.Parcel;
 import android.util.Log;
 
 import za.co.circleos.sdpkt.ShongololoTransaction;
 
+import org.json.JSONException;
+import org.json.JSONObject;
+
+import java.io.IOException;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -32,9 +40,18 @@ import java.util.concurrent.TimeUnit;
  */
 public class SettlementQueue {
 
-    private static final String TAG           = "SdpktSettlement";
-    private static final int    MAX_RETRIES   = 3;
-    private static final long   RETRY_DELAY_MS= 30_000L;  // 30 s
+    private static final String TAG             = "SdpktSettlement";
+    private static final int    MAX_RETRIES     = 3;
+    private static final long   RETRY_DELAY_MS  = 30_000L;  // 30 s
+
+    /** CircleOS settlement backend endpoint. */
+    private static final String SETTLEMENT_URL  =
+            "https://sleptonapi.thegeeknetwork.co.za/api/sdpkt/settle";
+    private static final int    SETTLE_TIMEOUT_MS = 15_000;
+
+    // Mesh TX frame types — mirrors MeshProtocol constants to avoid cross-package import.
+    private static final int MESH_TYPE_TX_SYNC = 0x20;
+    private static final int MESH_TYPE_TX_ACK  = 0x21;
 
     private final OfflineTransactionLog mLog;
     private final WalletStore           mStore;
@@ -143,27 +160,117 @@ public class SettlementQueue {
     /**
      * Core settlement logic.
      *
-     * Phase 2 (local verification):
-     *   - For SEND: re-verify our own signature — it must be valid.
-     *     This catches TEE corruption or log tampering.
-     *   - For RECEIVE: already verified on receipt; just confirm funds.
+     * Step 1: local signature re-verification (catches TEE corruption / log tampering).
+     * Step 2: HTTP POST to the CircleOS settlement backend.
      *
-     * Phase 4 (network settlement):
-     *   Replace this method body with an HTTP POST to the Circle settlement endpoint.
+     * Return values:
+     *   true  — settled successfully
+     *   false — permanent rejection (do NOT retry; caller will reverse the tx)
+     *   throw — transient failure (caller retries up to MAX_RETRIES times)
      */
     private boolean attemptSettle(ShongololoTransaction tx) {
+        // ── Step 1: local re-verification ─────────────────────────────────────
         if (tx.type == ShongololoTransaction.TYPE_SEND) {
-            // Re-verify our own outbound signature to detect log tampering
             int result = mSigner.verify(tx, mNonceCache);
             if (result != TransactionSigner.VERIFY_OK
                     && result != TransactionSigner.VERIFY_REPLAY) {
-                // VERIFY_REPLAY is acceptable for re-settlement — nonce was already consumed
                 Log.w(TAG, "Outbound tx " + tx.txId + " failed re-verification: " + result);
-                return false;
+                return false; // permanent rejection — no point posting to server
             }
         }
-        // All good — Phase 2 local settlement succeeds
-        return true;
+
+        // ── Step 2: HTTP POST to settlement backend ────────────────────────────
+        try {
+            byte[] body = buildSettleJson(tx).getBytes(StandardCharsets.UTF_8);
+
+            URL url = new URL(SETTLEMENT_URL);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("X-CircleOS-Version", "1");
+            conn.setConnectTimeout(SETTLE_TIMEOUT_MS);
+            conn.setReadTimeout(SETTLE_TIMEOUT_MS);
+            conn.setDoOutput(true);
+
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body);
+            }
+
+            int code = conn.getResponseCode();
+            conn.disconnect();
+
+            if (code >= 200 && code < 300) {
+                Log.i(TAG, "Settlement OK: " + tx.txId + " HTTP " + code);
+                return true;
+            } else if (code == 409) {
+                // Conflict — duplicate / already settled; treat as success.
+                Log.i(TAG, "Settlement duplicate (409): " + tx.txId);
+                return true;
+            } else if (code >= 400 && code < 500) {
+                // Client error: double-spend, invalid signature, etc. — permanent.
+                Log.w(TAG, "Settlement permanently rejected: " + tx.txId + " HTTP " + code);
+                return false;
+            } else {
+                // 5xx or unexpected — throw so the retry loop retries.
+                throw new RuntimeException("Settlement server error HTTP " + code
+                        + " for " + tx.txId);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException("Settlement HTTP failed for " + tx.txId, e);
+        }
+    }
+
+    /** Serialises a transaction to JSON for the settlement POST body. */
+    private String buildSettleJson(ShongololoTransaction tx) {
+        JSONObject o = new JSONObject();
+        try {
+            o.put("tx_id",            tx.txId);
+            o.put("amount_cents",     tx.amountCents);
+            o.put("type",             tx.type);
+            o.put("sender_device_id", tx.senderDeviceId);
+            o.put("timestamp_ms",     System.currentTimeMillis());
+        } catch (JSONException e) {
+            Log.w(TAG, "buildSettleJson: JSON error for " + tx.txId, e);
+        }
+        return o.toString();
+    }
+
+    /**
+     * Called by SdpktTitaniumService when a TYPE_TX_SYNC or TYPE_TX_ACK mesh frame arrives.
+     *
+     * TYPE_TX_SYNC (0x20): a peer is sending us a transaction over the mesh — deserialise
+     *   from Parcel and enqueue for settlement.
+     * TYPE_TX_ACK  (0x21): our previously submitted transaction was acknowledged by a peer —
+     *   informational only; settlement still happens via the HTTP backend.
+     */
+    public void onMeshFrame(String senderDeviceId, byte[] payload, int frameType) {
+        if (frameType == MESH_TYPE_TX_SYNC) {
+            Parcel p = Parcel.obtain();
+            try {
+                p.unmarshall(payload, 0, payload.length);
+                p.setDataPosition(0);
+                ShongololoTransaction tx =
+                        ShongololoTransaction.CREATOR.createFromParcel(p);
+                if (tx != null && tx.txId != null && !tx.txId.isEmpty()) {
+                    Log.i(TAG, "onMeshFrame: TX_SYNC from " + senderDeviceId
+                            + " txId=" + tx.txId + " amount=" + tx.amountCents);
+                    enqueue(tx);
+                } else {
+                    Log.w(TAG, "onMeshFrame: TX_SYNC from " + senderDeviceId
+                            + " — null or empty txId after deserialisation");
+                }
+            } catch (Exception e) {
+                Log.w(TAG, "onMeshFrame: TX_SYNC deserialise failed from " + senderDeviceId, e);
+            } finally {
+                p.recycle();
+            }
+        } else if (frameType == MESH_TYPE_TX_ACK) {
+            Log.d(TAG, "onMeshFrame: TX_ACK from " + senderDeviceId
+                    + " — settlement via HTTP backend");
+        } else {
+            Log.d(TAG, "onMeshFrame: unknown frameType=0x"
+                    + Integer.toHexString(frameType) + " from " + senderDeviceId);
+        }
     }
 
     /**
