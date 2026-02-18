@@ -20,6 +20,12 @@ import java.security.PublicKey;
 import java.security.Signature;
 import java.security.spec.X509EncodedKeySpec;
 import java.util.List;
+import java.io.ByteArrayOutputStream;
+import java.security.SecureRandom;
+import java.util.concurrent.atomic.AtomicBoolean;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import org.json.JSONObject;
 
 /**
  * Data Acuity Network Client.
@@ -46,6 +52,8 @@ public class DataAcuityClient {
     private static final String FEED_DOMAINS_PATH = "/v1/feeds/c2_domains.txt";
     private static final String FEED_HASHES_PATH  = "/v1/feeds/malware_hashes.txt";
     private static final String SUBMIT_PATH     = "/v1/community/iocs";
+    private static final String WS_PATH         = "/v1/ws/threats";
+    private static final int    WS_PORT          = 443;
 
     private static final String FEEDS_DIR = "/data/circle/security/feeds/";
     private static final int    TIMEOUT_MS = 30_000;
@@ -61,6 +69,12 @@ public class DataAcuityClient {
 
     /** Cached decoded public key — loaded once on first use. */
     private volatile PublicKey mCachedPublicKey;
+
+    // ── Phase 3: WebSocket ────────────────────────────────────────────────────
+    private ThreatPushListener mWsListener;
+    private final AtomicBoolean mWsRunning = new AtomicBoolean(false);
+    private volatile SSLSocket mWsSocket;
+    private Thread mWsThread;
 
     /**
      * Download and verify all threat feeds.
@@ -228,5 +242,206 @@ public class DataAcuityClient {
 
     private String escapeJson(String s) {
         return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /* ── Phase 3: WebSocket real-time threat push ──────────────────────── */
+
+    /**
+     * Callback interface for real-time threat push from Data Acuity.
+     * Called on the WebSocket read thread — implementations must be thread-safe.
+     */
+    public interface ThreatPushListener {
+        void onCriticalThreat(String iocType, String value, int confidence);
+        void onFeedRefreshRequired();
+    }
+
+    /** Start WebSocket. Reconnects automatically on failure with exponential backoff. */
+    public void startWebSocket(ThreatPushListener listener) {
+        if (!mWsRunning.compareAndSet(false, true)) {
+            Log.w(TAG, "WebSocket already running");
+            return;
+        }
+        mWsListener = listener;
+        mWsThread = new Thread(this::wsLoop, "DataAcuity-WS");
+        mWsThread.setDaemon(true);
+        mWsThread.start();
+        Log.i(TAG, "WebSocket thread started");
+    }
+
+    /** Stop the WebSocket connection. */
+    public void stopWebSocket() {
+        mWsRunning.set(false);
+        closeWsSocket();
+        if (mWsThread != null) mWsThread.interrupt();
+    }
+
+    private void wsLoop() {
+        int backoffMs = 5_000;
+        while (mWsRunning.get()) {
+            try {
+                wsConnect();
+                backoffMs = 5_000;
+            } catch (InterruptedException ie) {
+                break;
+            } catch (Exception e) {
+                Log.w(TAG, "WS disconnected: " + e.getMessage()
+                        + " — retry in " + (backoffMs / 1000) + "s");
+                try { Thread.sleep(backoffMs); } catch (InterruptedException ie) { break; }
+                backoffMs = Math.min(backoffMs * 2, 300_000);
+            }
+        }
+        Log.i(TAG, "WebSocket thread stopped");
+    }
+
+    private void wsConnect() throws Exception {
+        String host = BASE_URL.replace("https://", "").replace("http://", "");
+        SSLSocketFactory sf = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket sock = (SSLSocket) sf.createSocket(host, WS_PORT);
+        sock.setSoTimeout(70_000);
+        mWsSocket = sock;
+
+        String wsKey = generateWsKey();
+        String req = "GET " + WS_PATH + " HTTP/1.1\r\n"
+                + "Host: " + host + "\r\n"
+                + "Upgrade: websocket\r\n"
+                + "Connection: Upgrade\r\n"
+                + "Sec-WebSocket-Key: " + wsKey + "\r\n"
+                + "Sec-WebSocket-Version: 13\r\n"
+                + "User-Agent: CircleOS-Security/1.0\r\n"
+                + "\r\n";
+        sock.getOutputStream().write(req.getBytes(StandardCharsets.US_ASCII));
+        sock.getOutputStream().flush();
+
+        String resp = readHttpHeader(sock.getInputStream());
+        if (!resp.contains("101")) {
+            throw new java.io.IOException("WS handshake failed: "
+                    + resp.substring(0, Math.min(resp.length(), 120)));
+        }
+        Log.i(TAG, "WebSocket connected");
+        wsReadLoop(sock);
+    }
+
+    private void wsReadLoop(SSLSocket sock) throws Exception {
+        InputStream  is = sock.getInputStream();
+        OutputStream os = sock.getOutputStream();
+        long lastPingMs = System.currentTimeMillis();
+
+        while (mWsRunning.get()) {
+            if (System.currentTimeMillis() - lastPingMs > 30_000) {
+                wsSendFrame(os, (byte) 0x09, new byte[0]);
+                lastPingMs = System.currentTimeMillis();
+            }
+
+            int b0 = is.read();
+            if (b0 < 0) throw new java.io.IOException("EOF on WS stream");
+            int b1 = is.read();
+            if (b1 < 0) throw new java.io.IOException("EOF on WS stream");
+
+            int     opcode     = b0 & 0x0F;
+            boolean masked     = (b1 & 0x80) != 0;
+            long    payloadLen = b1 & 0x7F;
+
+            if (payloadLen == 126) {
+                payloadLen = ((long)(is.read() & 0xFF) << 8) | (is.read() & 0xFF);
+            } else if (payloadLen == 127) {
+                payloadLen = 0;
+                for (int i = 0; i < 8; i++) payloadLen = (payloadLen << 8) | (is.read() & 0xFF);
+            }
+
+            byte[] maskKey = null;
+            if (masked) {
+                maskKey = new byte[4];
+                for (int i = 0; i < 4; i++) maskKey[i] = (byte) is.read();
+            }
+
+            int safeLen = (int) Math.min(payloadLen, 1 << 20);
+            byte[] payload = new byte[safeLen];
+            wsReadFully(is, payload);
+            if (masked && maskKey != null) {
+                for (int i = 0; i < payload.length; i++) payload[i] ^= maskKey[i % 4];
+            }
+
+            switch (opcode) {
+                case 0x01: handleWsMessage(new String(payload, StandardCharsets.UTF_8)); break;
+                case 0x08: Log.i(TAG, "Server WS close"); return;
+                case 0x09: wsSendFrame(os, (byte) 0x0A, payload); break;
+                case 0x0A: lastPingMs = System.currentTimeMillis(); break;
+                default:   Log.d(TAG, "WS opcode 0x" + Integer.toHexString(opcode)); break;
+            }
+        }
+    }
+
+    private void handleWsMessage(String json) {
+        if (mWsListener == null) return;
+        try {
+            JSONObject obj = new JSONObject(json);
+            String msgType = obj.optString("type", "");
+            Log.d(TAG, "WS: " + msgType);
+            if ("CRITICAL_THREAT".equals(msgType)) {
+                String iocType = obj.optString("ioc_type", "UNKNOWN");
+                String value   = obj.optString("value", "");
+                int confidence = obj.optInt("confidence", 50);
+                if (!value.isEmpty()) mWsListener.onCriticalThreat(iocType, value, confidence);
+            } else if ("FEED_REFRESH".equals(msgType)) {
+                mWsListener.onFeedRefreshRequired();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "WS parse error: " + e.getMessage());
+        }
+    }
+
+    private synchronized void wsSendFrame(OutputStream os, byte opcode, byte[] payload)
+            throws java.io.IOException {
+        byte[] mask = new byte[4];
+        new SecureRandom().nextBytes(mask);
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x80 | (opcode & 0x0F));
+        int len = payload.length;
+        if (len < 126) {
+            buf.write(0x80 | len);
+        } else if (len < 65536) {
+            buf.write(0x80 | 126);
+            buf.write((len >> 8) & 0xFF);
+            buf.write(len & 0xFF);
+        } else {
+            buf.write(0x80 | 127);
+            for (int i = 7; i >= 0; i--) buf.write((int)((len >> (i * 8)) & 0xFF));
+        }
+        buf.write(mask);
+        for (int i = 0; i < payload.length; i++) buf.write(payload[i] ^ mask[i % 4]);
+        os.write(buf.toByteArray());
+        os.flush();
+    }
+
+    private String readHttpHeader(InputStream is) throws java.io.IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        int p3 = 0, p2 = 0, p1 = 0;
+        for (int b; (b = is.read()) >= 0;) {
+            baos.write(b);
+            if (p3 == '\r' && p2 == '\n' && p1 == '\r' && b == '\n') break;
+            p3 = p2; p2 = p1; p1 = b;
+        }
+        return new String(baos.toByteArray(), StandardCharsets.US_ASCII);
+    }
+
+    private void wsReadFully(InputStream is, byte[] buf) throws java.io.IOException {
+        int off = 0;
+        while (off < buf.length) {
+            int n = is.read(buf, off, buf.length - off);
+            if (n < 0) throw new java.io.IOException("Unexpected EOF");
+            off += n;
+        }
+    }
+
+    private String generateWsKey() {
+        byte[] key = new byte[16];
+        new SecureRandom().nextBytes(key);
+        return Base64.encodeToString(key, Base64.NO_WRAP);
+    }
+
+    private void closeWsSocket() {
+        SSLSocket s = mWsSocket;
+        if (s != null) { try { s.close(); } catch (Exception ignored) {} }
+        mWsSocket = null;
     }
 }
