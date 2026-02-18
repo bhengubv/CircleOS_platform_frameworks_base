@@ -10,6 +10,8 @@ import android.circleos.ICirclePrivacyManager;
 import android.circleos.PermissionUsageRecord;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
 import android.database.Cursor;
 import android.database.sqlite.SQLiteDatabase;
 import android.database.sqlite.SQLiteOpenHelper;
@@ -22,6 +24,7 @@ import com.android.server.SystemService;
 
 import java.io.File;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Circle OS Privacy Manager — the central coordinator of all privacy subsystems.
@@ -49,6 +52,9 @@ public class CirclePrivacyManagerService extends SystemService {
     private static final String POLICY_DB_PATH = "/data/circle/privacy/policies.db";
     private static final int    POLICY_DB_VER  = 1;
     private static final String POLICY_TABLE   = "app_policies";
+
+    /** Revoke grants for apps unused for this long (30 days). */
+    private static final long REVOKE_IDLE_WINDOW_MS = TimeUnit.DAYS.toMillis(30);
 
     // ---- Policy DB helper ----
 
@@ -188,9 +194,51 @@ public class CirclePrivacyManagerService extends SystemService {
             enforceManagePrivacy();
             mHandler.post(() -> {
                 Slog.i(TAG, "revokeUnusedPermissions: scanning all packages…");
-                // TODO Phase 3: query PackageManager for installed packages,
-                // check last-used timestamps, revoke stale grants.
-                mLogger.log("system", "ALL_PERMISSIONS", "AUTO_REVOKE_SCAN", null);
+                long cutoff = System.currentTimeMillis() - REVOKE_IDLE_WINDOW_MS;
+                PackageManager pm = getContext().getPackageManager();
+                List<ApplicationInfo> apps;
+                try {
+                    apps = pm.getInstalledApplications(PackageManager.GET_META_DATA);
+                } catch (Exception e) {
+                    Slog.e(TAG, "revokeUnusedPermissions: PackageManager failed", e);
+                    return;
+                }
+                int revoked = 0;
+                for (ApplicationInfo app : apps) {
+                    String pkg = app.packageName;
+                    AppPrivacyPolicy policy = loadPolicy(pkg);
+                    // Only act if the app has been granted at least one non-default permission
+                    if (!policy.networkAllowed && !policy.contactsAllowed
+                            && !policy.storageAllowed && policy.allowedSensors.isEmpty()) {
+                        continue;
+                    }
+                    // Check for any usage record since the cutoff
+                    List<PermissionUsageRecord> recent = mLogger.query(pkg, cutoff);
+                    if (!recent.isEmpty()) continue; // still active — leave it
+
+                    // No usage since cutoff: revoke network, contacts, storage, sensors
+                    AppPrivacyPolicy stripped = new AppPrivacyPolicy();
+                    stripped.networkAllowed  = false;
+                    stripped.contactsAllowed = false;
+                    stripped.storageAllowed  = false;
+                    stripped.allowedSensors  = new java.util.ArrayList<>();
+                    // Preserve static settings that aren't usage-gated
+                    stripped.wifiOnly   = policy.wifiOnly;
+                    stripped.mobileOnly = policy.mobileOnly;
+                    stripped.lobbyMode  = policy.lobbyMode;
+                    stripped.allowedDomains = policy.allowedDomains;
+
+                    persistPolicy(pkg, stripped);
+                    applyPolicy(pkg, stripped);
+                    mLogger.log("system", pkg, "AUTO_REVOKE",
+                            "idle >" + (REVOKE_IDLE_WINDOW_MS / 86400000L) + "d");
+                    Slog.i(TAG, "Auto-revoked: " + pkg);
+                    revoked++;
+                }
+                mLogger.log("system", "ALL_PERMISSIONS", "AUTO_REVOKE_SCAN",
+                        "revoked=" + revoked + "/" + apps.size());
+                Slog.i(TAG, "Auto-revoke scan complete: " + revoked + "/" + apps.size()
+                        + " packages stripped");
             });
         }
     };

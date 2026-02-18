@@ -385,10 +385,43 @@ public final class CircleMeshService extends SystemService {
         Log.i(TAG, "Message delivered: type=0x" + Integer.toHexString(msg.type)
                 + " from=" + msg.getSenderHex() + " via=" + from);
 
-        if (msg.type == MeshProtocol.TYPE_MSG_TEXT && msg.payload != null) {
-            broadcastTextMessage(msg.getSenderHex(), msg.payload);
+        if (msg.payload == null) return;
+        switch (msg.type) {
+            case MeshProtocol.TYPE_MSG_TEXT:
+            case MeshProtocol.TYPE_MSG_MEDIA:
+                broadcastTextMessage(msg.getSenderHex(), msg.payload);
+                break;
+
+            case MeshProtocol.TYPE_MSG_ACK:
+            case MeshProtocol.TYPE_MSG_READ:
+                // Delivery receipt — notify Butler app
+                broadcastFrameToButler(msg.type, msg.getSenderHex(), msg.payload);
+                break;
+
+            case MeshProtocol.TYPE_TX_SYNC:
+            case MeshProtocol.TYPE_TX_ACK:
+                // SDPKT wallet transaction — deliver to SdpktTitaniumService in-process
+                routeTxFrame(msg.getSenderHex(), msg.payload, msg.type);
+                break;
+
+            case MeshProtocol.TYPE_BUTLER_REQ:
+            case MeshProtocol.TYPE_BUTLER_RES:
+                // Butler relay — broadcast to Butler app for handling
+                broadcastFrameToButler(msg.type, msg.getSenderHex(), msg.payload);
+                break;
+
+            case MeshProtocol.TYPE_FILE_OFFER:
+            case MeshProtocol.TYPE_FILE_ACCEPT:
+            case MeshProtocol.TYPE_FILE_DATA:
+            case MeshProtocol.TYPE_FILE_COMPLETE:
+                // File share — broadcast to Butler app; DMZ scans on TYPE_FILE_COMPLETE
+                broadcastFileFrame(msg.type, msg.getSenderHex(), msg.payload);
+                break;
+
+            default:
+                Log.d(TAG, "onMessageDelivered: unhandled type 0x"
+                        + Integer.toHexString(msg.type & 0xFF));
         }
-        // TODO: route OTA, TX, FILE, Butler frames to their respective handlers
     }
 
     private void broadcastTextMessage(String senderId, byte[] payload) {
@@ -403,6 +436,66 @@ public final class CircleMeshService extends SystemService {
         } catch (Exception e) {
             Log.w(TAG, "broadcastTextMessage failed", e);
         }
+    }
+
+    /** Broadcast action for Butler relay frames (TX acks, file offers, etc.). */
+    public static final String ACTION_BUTLER_FRAME   = "za.co.circleos.mesh.action.BUTLER_FRAME";
+    public static final String EXTRA_FRAME_TYPE      = "frame_type";
+    public static final String EXTRA_FRAME_PAYLOAD   = "frame_payload";
+
+    /** Broadcast action for incoming file-share frames. */
+    public static final String ACTION_FILE_FRAME     = "za.co.circleos.mesh.action.FILE_FRAME";
+
+    private void broadcastFrameToButler(int frameType, String senderId, byte[] payload) {
+        try {
+            android.content.Intent intent = new android.content.Intent(ACTION_BUTLER_FRAME);
+            intent.putExtra(EXTRA_SENDER_ID, senderId);
+            intent.putExtra(EXTRA_FRAME_TYPE, frameType);
+            intent.putExtra(EXTRA_FRAME_PAYLOAD, payload);
+            intent.setPackage("za.co.circleos.butler");
+            getContext().sendBroadcast(intent);
+            Log.d(TAG, "Butler frame broadcast type=0x"
+                    + Integer.toHexString(frameType & 0xFF) + " from " + senderId);
+        } catch (Exception e) {
+            Log.w(TAG, "broadcastFrameToButler failed", e);
+        }
+    }
+
+    private void broadcastFileFrame(int frameType, String senderId, byte[] payload) {
+        try {
+            android.content.Intent intent = new android.content.Intent(ACTION_FILE_FRAME);
+            intent.putExtra(EXTRA_SENDER_ID, senderId);
+            intent.putExtra(EXTRA_FRAME_TYPE, frameType);
+            intent.putExtra(EXTRA_FRAME_PAYLOAD, payload);
+            // Delivered to any registered file-share listener (Butler, system DMZ)
+            getContext().sendBroadcast(intent);
+            Log.d(TAG, "File frame broadcast type=0x"
+                    + Integer.toHexString(frameType & 0xFF) + " from " + senderId);
+        } catch (Exception e) {
+            Log.w(TAG, "broadcastFileFrame failed", e);
+        }
+    }
+
+    /**
+     * Routes a TX_SYNC or TX_ACK frame to SdpktTitaniumService via LocalServices.
+     * If the service is not yet registered, broadcasts the payload so the SDPKT
+     * app-layer receiver can pick it up.
+     */
+    private void routeTxFrame(String senderId, byte[] payload, int frameType) {
+        try {
+            Object sdpkt = com.android.server.LocalServices.getService(
+                    com.circleos.server.sdpkt.SdpktTitaniumService.class);
+            if (sdpkt instanceof com.circleos.server.sdpkt.SdpktTitaniumService) {
+                ((com.circleos.server.sdpkt.SdpktTitaniumService) sdpkt)
+                        .onMeshTxFrame(senderId, payload, frameType);
+                Log.d(TAG, "TX frame routed to SdpktTitaniumService from " + senderId);
+                return;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "routeTxFrame: LocalServices lookup failed", e);
+        }
+        // Fallback: broadcast so SDPKT binder receiver can handle it
+        broadcastFrameToButler(frameType, senderId, payload);
     }
 
     // ── Local WiFi IP detection ───────────────────────────────────────────────

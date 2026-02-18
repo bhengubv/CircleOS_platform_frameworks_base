@@ -7,12 +7,16 @@ package com.circleos.server.privacy;
 
 import android.app.job.JobInfo;
 import android.app.job.JobScheduler;
+import android.circleos.AppPrivacyPolicy;
 import android.circleos.ICirclePermissionService;
+import android.circleos.ICirclePrivacyManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.hardware.SensorPrivacyManager;
 import android.os.Binder;
 import android.os.IBinder;
+import android.os.RemoteException;
+import android.os.ServiceManager;
 import android.util.Slog;
 
 import com.android.server.SystemService;
@@ -127,10 +131,35 @@ public class CirclePermissionService extends SystemService {
         @Override
         public boolean checkSensorPermission(String packageName, String sensorType) {
             enforceManagePrivacyPermission();
-            // Sensor permission is tracked in the privacy policy; query via logger
-            // (placeholder — full sensor hook into SensorPrivacyManager goes here).
-            Slog.d(TAG, "checkSensorPermission: " + packageName + " / " + sensorType);
-            return false; // Default deny
+
+            // 1. Hardware sensor privacy kill-switch (user toggled sensors off globally)
+            if (mSensorPrivacyManager != null
+                    && mSensorPrivacyManager.isSensorPrivacyEnabled()) {
+                Slog.d(TAG, "checkSensorPermission: hardware kill-switch active → deny");
+                return false;
+            }
+
+            // 2. Per-app policy from CirclePrivacyManagerService
+            try {
+                IBinder binder = ServiceManager.checkService(
+                        CirclePrivacyManagerService.SERVICE_NAME);
+                if (binder != null) {
+                    ICirclePrivacyManager mgr = ICirclePrivacyManager.Stub.asInterface(binder);
+                    AppPrivacyPolicy policy = mgr.getPolicy(packageName);
+                    if (policy != null && policy.allowedSensors != null) {
+                        boolean allowed = policy.allowedSensors.contains(sensorType);
+                        Slog.d(TAG, "checkSensorPermission: " + packageName + "/" + sensorType
+                                + " → " + (allowed ? "allow" : "deny") + " (policy)");
+                        return allowed;
+                    }
+                }
+            } catch (RemoteException | SecurityException e) {
+                Slog.w(TAG, "checkSensorPermission: policy lookup failed: " + e.getMessage());
+            }
+
+            Slog.d(TAG, "checkSensorPermission: " + packageName + "/" + sensorType
+                    + " → deny (no policy)");
+            return false;
         }
 
         @Override

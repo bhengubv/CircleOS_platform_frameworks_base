@@ -580,6 +580,24 @@ public class SdpktTitaniumService extends SystemService {
         public int getServiceVersion() { return VERSION; }
     }
 
+    // ── Mesh TX frame handler ─────────────────────────────────────────────────
+
+    /**
+     * Called by CircleMeshService when a TYPE_TX_SYNC or TYPE_TX_ACK frame
+     * arrives addressed to this device.
+     *
+     * TYPE_TX_SYNC: a peer is proposing a transaction — validate and ACK.
+     * TYPE_TX_ACK:  our previously proposed transaction was accepted by the peer.
+     */
+    public void onMeshTxFrame(String senderDeviceId, byte[] payload, int frameType) {
+        if (payload == null || payload.length == 0) return;
+        Log.i(TAG, "onMeshTxFrame: type=0x" + Integer.toHexString(frameType)
+                + " from=" + senderDeviceId + " len=" + payload.length);
+        if (mSettlementQueue != null) {
+            mSettlementQueue.onMeshFrame(senderDeviceId, payload, frameType);
+        }
+    }
+
     // ── Phase 6: linked device persistence ───────────────────────────────────
 
     /**
