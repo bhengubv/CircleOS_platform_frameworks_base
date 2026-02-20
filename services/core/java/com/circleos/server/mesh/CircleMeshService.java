@@ -250,12 +250,14 @@ public final class CircleMeshService extends SystemService {
         if (mBatteryPct >= BATT_SUSPEND_MIN) {
             mWifiTransport.start();
             mMdnsTransport.start();
-            // Tell BLE GATT server our local WiFi-Direct TCP address
-            // so scanning peers can read it via the WiFi-IP characteristic.
+            // Tell BLE GATT server + WiFi Direct DNS-SD our local TCP address
+            // so scanning peers can connect to us.  Wait 2 s for the TCP server to bind.
             mHandler.postDelayed(() -> {
                 String localIp = detectLocalWifiIp();
                 if (localIp != null) {
                     mBleTransport.setLocalWifiEndpoint(localIp, WifiDirectTransport.MESH_PORT);
+                    // Also update the DNS-SD TXT record so WiFi Direct peers know our IP.
+                    mWifiTransport.setLocalIp(localIp);
                 }
             }, 2_000); // wait 2 s for TCP server to bind
         }
@@ -427,11 +429,21 @@ public final class CircleMeshService extends SystemService {
     private void broadcastTextMessage(String senderId, byte[] payload) {
         try {
             String text = new String(payload, "UTF-8");
-            android.content.Intent intent = new android.content.Intent(ACTION_MESSAGE_RECEIVED);
-            intent.putExtra(EXTRA_SENDER_ID, senderId);
-            intent.putExtra(EXTRA_MSG_TEXT, text);
-            intent.setPackage("za.co.circleos.butler");
-            getContext().sendBroadcast(intent);
+
+            // Deliver to CircleMessages (primary messaging app)
+            android.content.Intent msgIntent = new android.content.Intent(ACTION_MESSAGE_RECEIVED);
+            msgIntent.putExtra(EXTRA_SENDER_ID, senderId);
+            msgIntent.putExtra(EXTRA_MSG_TEXT, text);
+            msgIntent.setPackage("za.co.circleos.messages");
+            getContext().sendBroadcast(msgIntent);
+
+            // Also deliver to Butler so its MeshActivity stays in sync
+            android.content.Intent butlerIntent = new android.content.Intent(ACTION_MESSAGE_RECEIVED);
+            butlerIntent.putExtra(EXTRA_SENDER_ID, senderId);
+            butlerIntent.putExtra(EXTRA_MSG_TEXT, text);
+            butlerIntent.setPackage("za.co.circleos.butler");
+            getContext().sendBroadcast(butlerIntent);
+
             Log.d(TAG, "Broadcast MESSAGE_RECEIVED from " + senderId);
         } catch (Exception e) {
             Log.w(TAG, "broadcastTextMessage failed", e);

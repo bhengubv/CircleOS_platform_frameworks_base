@@ -57,6 +57,9 @@ public class WifiDirectTransport extends MeshTransport {
     private final ExecutorService mExecutor = Executors.newCachedThreadPool();
     private final AtomicBoolean  mRunning   = new AtomicBoolean(false);
 
+    /** Local IP address included in DNS-SD TXT record so peers can TCP-connect to us. */
+    private volatile String      mLocalIp;
+
     // ── Constructor ───────────────────────────────────────────────────────────
 
     /**
@@ -157,6 +160,24 @@ public class WifiDirectTransport extends MeshTransport {
         return true;
     }
 
+    /**
+     * Sets the local IP address advertised in the DNS-SD TXT record.
+     *
+     * <p>Must be called after the TCP server has bound and the local WiFi
+     * interface address is known (typically 192.168.49.x for a WiFi Direct
+     * group owner, or DHCP-assigned for clients).  Re-registers the service
+     * record immediately so newly discovered peers get the updated IP.
+     *
+     * @param localIp IPv4 address string (e.g. "192.168.49.1").
+     */
+    public void setLocalIp(String localIp) {
+        mLocalIp = localIp;
+        Log.d(TAG, "Local IP updated: " + localIp + " — re-registering DNS-SD service");
+        if (mRunning.get()) {
+            registerService();
+        }
+    }
+
     @Override
     public void announce(byte[] frame) {
         // Broadcast to all currently known peers — handled at MeshRouter level
@@ -216,6 +237,9 @@ public class WifiDirectTransport extends MeshTransport {
         record.put("caps", mCapabilities != null ? mCapabilities : "");
         record.put("ver", mVersion != null ? mVersion : "");
         record.put("port", String.valueOf(MESH_PORT));
+        // Include local IP so discovering peers can open a TCP connection directly.
+        // Without this, the MAC address from WifiP2pDevice cannot be used for TCP.
+        if (mLocalIp != null) record.put("ip", mLocalIp);
 
         WifiP2pDnsSdServiceInfo info = WifiP2pDnsSdServiceInfo.newInstance(
                 SERVICE_NAME, SERVICE_TYPE, record);
@@ -245,18 +269,26 @@ public class WifiDirectTransport extends MeshTransport {
 
         // TXT record callback
         WifiP2pManager.DnsSdTxtRecordListener txtListener = (fullDomain, record, device) -> {
-            String peerId  = record.get("id");
+            String peerId   = record.get("id");
             String peerCaps = record.get("caps");
-            String portStr = record.get("port");
+            String portStr  = record.get("port");
+            String peerIp   = record.get("ip");  // IP address advertised by the peer
             int port = MESH_PORT;
             try { if (portStr != null) port = Integer.parseInt(portStr); } catch (NumberFormatException ignored) {}
 
-            String address = device.deviceAddress; // MAC for WiFi Direct
+            // Prefer the explicit "ip" field from the TXT record.
+            // Falling back to device.deviceAddress would give a MAC address,
+            // which is useless for TCP connections.
+            if (peerIp == null || peerIp.isEmpty()) {
+                Log.d(TAG, "TXT record from " + device.deviceName
+                        + " has no 'ip' field — skipping until peer sets local IP");
+                return;
+            }
             Log.d(TAG, "TXT record from " + device.deviceName
-                    + " id=" + peerId + " caps=" + peerCaps);
+                    + " id=" + peerId + " ip=" + peerIp + " caps=" + peerCaps);
 
             if (peerId != null && mDiscoveryListener != null) {
-                mDiscoveryListener.onPeerDiscovered(peerId, address, port, TYPE_WIFI_DIRECT, peerCaps);
+                mDiscoveryListener.onPeerDiscovered(peerId, peerIp, port, TYPE_WIFI_DIRECT, peerCaps);
             }
         };
 
