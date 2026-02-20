@@ -9,6 +9,7 @@ import android.os.HandlerThread;
 import android.os.ParcelFileDescriptor;
 import android.util.Log;
 
+import com.android.server.LocalServices;
 import com.android.server.SystemService;
 
 import za.co.circleos.compression.CompressionRequest;
@@ -56,6 +57,9 @@ public class CircleCompressionService extends SystemService {
     private ImageCompressor     mImageCompressor;
     private DocumentCompressor  mDocumentCompressor;
     private ArchiveCompressor   mArchiveCompressor;
+    private ZstdCompressor      mZstdCompressor;     // Phase 2: ZSTD archive backend
+    private VideoCompressor     mVideoCompressor;    // Phase 2: HEVC video transcoding
+    private AudioCompressor     mAudioCompressor;    // Phase 2: AAC audio transcoding
     private MetadataStripper    mMetadataStripper;
     private CompressionStatsTracker mStatsTracker;
     private HandlerThread       mWorkerThread;
@@ -93,6 +97,9 @@ public class CircleCompressionService extends SystemService {
     @Override
     public void onStart() {
         publishBinderService(SERVICE_NAME, mBinderService);
+        // Register with LocalServices so other system services (Traffic Lobby, File DMZ)
+        // can call compressDirect() and compressOutbound() without IPC.
+        LocalServices.addService(CircleCompressionService.class, this);
         Log.i(TAG, "CircleCompressionService started");
     }
 
@@ -100,15 +107,19 @@ public class CircleCompressionService extends SystemService {
     public void onBootPhase(int phase) {
         if (phase == PHASE_BOOT_COMPLETED) {
             new File(WORK_DIR).mkdirs();
-            mWorkerThread      = new HandlerThread("CircleCompression");
+            mWorkerThread       = new HandlerThread("CircleCompression");
             mWorkerThread.start();
-            mWorkerHandler     = new android.os.Handler(mWorkerThread.getLooper());
-            mImageCompressor   = new ImageCompressor();
-            mDocumentCompressor= new DocumentCompressor();
-            mArchiveCompressor = new ArchiveCompressor();
-            mMetadataStripper  = new MetadataStripper();
-            mStatsTracker      = new CompressionStatsTracker(getContext());
-            Log.i(TAG, "CircleCompressionService boot-complete init done");
+            mWorkerHandler      = new android.os.Handler(mWorkerThread.getLooper());
+            mImageCompressor    = new ImageCompressor();
+            mDocumentCompressor = new DocumentCompressor();
+            mArchiveCompressor  = new ArchiveCompressor();
+            mZstdCompressor     = new ZstdCompressor();   // Phase 2
+            mVideoCompressor    = new VideoCompressor();  // Phase 2
+            mAudioCompressor    = new AudioCompressor();  // Phase 2
+            mMetadataStripper   = new MetadataStripper();
+            mStatsTracker       = new CompressionStatsTracker(getContext());
+            Log.i(TAG, "CircleCompressionService boot-complete init done"
+                    + " (ZSTD native=" + ZstdCompressor.isNativeAvailable() + ")");
         }
     }
 
@@ -145,6 +156,28 @@ public class CircleCompressionService extends SystemService {
             mStatsTracker.record(result, direction);
         }
         return result;
+    }
+
+    /**
+     * Traffic Lobby outbound hook — compress a file before it is transmitted.
+     *
+     * <p>Called by Traffic Lobby (or any other system service) when a large
+     * outbound file is detected.  Always strips metadata.  Returns the
+     * compressed file as a temp file; caller is responsible for deletion after use.
+     *
+     * <p>This is an alias for {@link #compressDirect} with
+     * {@code direction=DIRECTION_OUTBOUND} that exposes the method via
+     * {@link LocalServices} without requiring IPC.
+     *
+     * @param inputFile  File to compress (not modified in place).
+     * @param mimeType   MIME type, or null to guess from extension.
+     * @param tier       {@link CompressionRequest#TIER_VISUALLY_LOSSLESS} recommended.
+     * @return CompressionResult; if STATUS_OK, outputFile contains compressed bytes.
+     */
+    public CompressionResult compressOutbound(File inputFile, File outputFile,
+                                              String mimeType, int tier) {
+        return compressDirect(inputFile, outputFile, mimeType, tier,
+                CompressionRequest.DIRECTION_OUTBOUND);
     }
 
     /* ── Binder ───────────────────────────────────────────────────────── */
@@ -261,7 +294,20 @@ public class CircleCompressionService extends SystemService {
                 if (stripped) result.metadataStripped = true;
             }
         } else if (isArchive(mimeType, inputFile.getName())) {
-            result = mArchiveCompressor.compress(inputFile, outputFile, mimeType, tier);
+            // Phase 2: use ZSTD compressor (degrades to DEFLATE-9 if native not loaded)
+            result = (mZstdCompressor != null)
+                    ? mZstdCompressor.compress(inputFile, outputFile, tier)
+                    : mArchiveCompressor.compress(inputFile, outputFile, mimeType, tier);
+        } else if (isVideo(mimeType, inputFile.getName())) {
+            // Phase 2: HEVC video transcoding
+            result = (mVideoCompressor != null)
+                    ? mVideoCompressor.compress(inputFile, outputFile, tier)
+                    : skip(inputFile, "video-phase2-not-ready");
+        } else if (isAudio(mimeType, inputFile.getName())) {
+            // Phase 2: AAC audio transcoding
+            result = (mAudioCompressor != null)
+                    ? mAudioCompressor.compress(inputFile, outputFile, tier)
+                    : skip(inputFile, "audio-phase2-not-ready");
         } else {
             // Unknown type — outbound metadata strip only, no compression
             if (stripMeta) {
@@ -311,6 +357,29 @@ public class CircleCompressionService extends SystemService {
         return name.toLowerCase().endsWith(".zip");
     }
 
+    private boolean isVideo(String m, String name) {
+        if (m != null && m.startsWith("video/")) return true;
+        String n = name.toLowerCase();
+        return n.endsWith(".mp4") || n.endsWith(".mov") || n.endsWith(".mkv")
+            || n.endsWith(".avi") || n.endsWith(".webm") || n.endsWith(".3gp");
+    }
+
+    private boolean isAudio(String m, String name) {
+        if (m != null && m.startsWith("audio/")) return true;
+        String n = name.toLowerCase();
+        return n.endsWith(".mp3") || n.endsWith(".aac") || n.endsWith(".m4a")
+            || n.endsWith(".ogg") || n.endsWith(".flac") || n.endsWith(".opus");
+    }
+
+    private CompressionResult skip(File inputFile, String method) {
+        CompressionResult r = new CompressionResult();
+        r.status          = CompressionResult.STATUS_SKIPPED;
+        r.originalBytes   = inputFile.length();
+        r.compressedBytes = r.originalBytes;
+        r.method          = method;
+        return r;
+    }
+
     private String guessMime(String name) {
         String n = name.toLowerCase();
         if (n.endsWith(".jpg") || n.endsWith(".jpeg")) return "image/jpeg";
@@ -320,6 +389,15 @@ public class CircleCompressionService extends SystemService {
         if (n.endsWith(".pdf"))  return "application/pdf";
         if (n.endsWith(".zip"))  return "application/zip";
         if (n.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        // Phase 2: video and audio
+        if (n.endsWith(".mp4") || n.endsWith(".mov")) return "video/mp4";
+        if (n.endsWith(".mkv"))  return "video/x-matroska";
+        if (n.endsWith(".webm")) return "video/webm";
+        if (n.endsWith(".mp3"))  return "audio/mpeg";
+        if (n.endsWith(".aac") || n.endsWith(".m4a")) return "audio/mp4";
+        if (n.endsWith(".ogg"))  return "audio/ogg";
+        if (n.endsWith(".flac")) return "audio/flac";
+        if (n.endsWith(".opus")) return "audio/opus";
         return "application/octet-stream";
     }
 
