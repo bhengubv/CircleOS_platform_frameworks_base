@@ -2467,6 +2467,15 @@ public final class SystemServer implements Dumpable {
             }
             t.traceEnd();
 
+            t.traceBegin("StartCircleUpdateService");
+            try {
+                ServiceManager.addService("circle.update",
+                        new za.co.circleos.update.SystemUpdateService(context));
+            } catch (Throwable e) {
+                reportWtf("starting CircleUpdateService", e);
+            }
+            t.traceEnd();
+
             if (!isWatch && !disableNetworkTime) {
                 t.traceBegin("StartNetworkTimeUpdateService");
                 try {
