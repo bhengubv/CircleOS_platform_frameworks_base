@@ -20,7 +20,7 @@ rust_ffi_static {
 cc_library_shared {
     name: "libcircle_inference",
     srcs: [
-        "../../jni/circle_inference_jni.cpp",
+        "circle_inference_jni.cpp",
     ],
     static_libs: [
         "libcircle_inference_rust",
