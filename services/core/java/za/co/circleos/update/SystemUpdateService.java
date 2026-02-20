@@ -210,16 +210,23 @@ public class SystemUpdateService extends ICircleUpdateService.Stub {
                 return;
             }
 
+            // Response shape: { "hasUpdate": bool, "release": OsReleaseSummaryDto | null }
             JSONObject json = new JSONObject(response);
-            if (!json.optBoolean("updateAvailable", false)) {
+            if (!json.optBoolean("hasUpdate", false)) {
                 mState.set(STATE_IDLE);
                 return;
             }
 
-            mAvailableVersion = json.optString("version", null);
-            mPayloadUrl       = json.optString("payloadUrl", null);
-            mPayloadOffset    = json.optLong("payloadOffset", 0);
-            mPayloadSize      = json.optLong("payloadSize", 0);
+            JSONObject release = json.optJSONObject("release");
+            if (release == null) {
+                mState.set(STATE_IDLE);
+                return;
+            }
+
+            mAvailableVersion = release.optString("version", null);
+            mPayloadUrl       = release.optString("manifestUrl", null); // CDN URL for payload.bin
+            mPayloadOffset    = 0;   // full image, no offset
+            mPayloadSize      = 0;   // UpdateEngine will determine from payload_properties
 
             if (mPayloadUrl == null) {
                 mState.set(STATE_IDLE);
@@ -311,8 +318,10 @@ public class SystemUpdateService extends ICircleUpdateService.Stub {
      */
     private void pollCommands() {
         try {
-            String device  = SystemProperties.get("ro.circle.device.codename", Build.DEVICE);
-            String url = buildUrl("/api/os/commands/pending") + "?device=" + device;
+            String deviceHash = sha256(Build.ID);
+            String url = buildUrl("/api/os/commands/pending")
+                    + "?device_id_hash=" + deviceHash
+                    + "&channel=" + mChannel;
             String response = getJson(url);
             if (response == null || response.isEmpty()) return;
 
