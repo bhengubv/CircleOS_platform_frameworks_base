@@ -17,6 +17,12 @@ public final class NfcTransferRequest implements Parcelable {
     public String recipientPubkey;     // base64 public key (optional — filled in during handshake)
     public String memo;                // optional note (max 64 chars)
     public boolean lockScreenMode;     // true = initiated from lock screen quick pay (≤₷100 limit)
+    /**
+     * Device ID of the linked device initiating this payment (null = primary device, unlimited).
+     * Set by companion apps or wearable integrations that act on behalf of a secondary device.
+     * Used by ProtectionEngine to enforce per-device spending limits.
+     */
+    public String senderDeviceId;      // null = primary device
 
     public NfcTransferRequest() {}
 
@@ -25,6 +31,7 @@ public final class NfcTransferRequest implements Parcelable {
         recipientPubkey  = in.readString();
         memo             = in.readString();
         lockScreenMode   = in.readByte() != 0;
+        senderDeviceId   = in.readString();
     }
 
     @Override
@@ -33,6 +40,7 @@ public final class NfcTransferRequest implements Parcelable {
         dest.writeString(recipientPubkey);
         dest.writeString(memo);
         dest.writeByte((byte) (lockScreenMode ? 1 : 0));
+        dest.writeString(senderDeviceId);
     }
 
     @Override public int describeContents() { return 0; }

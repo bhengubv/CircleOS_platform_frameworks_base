@@ -11,6 +11,7 @@ import android.content.Context;
 import android.os.Handler;
 import android.util.Log;
 
+import za.co.circleos.sdpkt.DeviceLink;
 import za.co.circleos.sdpkt.LocationContext;
 import za.co.circleos.sdpkt.TransactionResult;
 
@@ -50,6 +51,8 @@ public class ProtectionEngine {
     private PersonalityModeAdapter      mPersonality;   // Phase 4
     private ProtectionLog               mProtectionLog; // Phase 5
     private CalibrationManager          mCalibration;   // Phase 5
+    /** Provider for linked device map — set in Phase 6 to enforce per-device spending limits. */
+    private java.util.function.Supplier<java.util.Map<String, DeviceLink>> mLinkedDevicesProvider;
 
     private boolean mNotifChannelCreated = false;
 
@@ -83,11 +86,25 @@ public class ProtectionEngine {
     /**
      * Evaluate whether to allow an outbound transfer.
      *
-     * @param amountCents  Transfer amount in cents.
-     * @param lockScreen   True if request comes from the lock screen.
+     * @param amountCents    Transfer amount in cents.
+     * @param lockScreen     True if request comes from the lock screen.
      * @return TransactionResult.ok() if allowed, or a specific failure result.
      */
     public TransactionResult evaluateTransfer(long amountCents, boolean lockScreen) {
+        return evaluateTransfer(amountCents, lockScreen, null);
+    }
+
+    /**
+     * Evaluate whether to allow an outbound transfer, with optional secondary device context.
+     *
+     * @param amountCents    Transfer amount in cents.
+     * @param lockScreen     True if request comes from the lock screen.
+     * @param senderDeviceId Device ID of the linked device initiating the payment,
+     *                       or null for the primary device (no per-device limit applied).
+     * @return TransactionResult.ok() if allowed, or a specific failure result.
+     */
+    public TransactionResult evaluateTransfer(long amountCents, boolean lockScreen,
+            String senderDeviceId) {
 
         // ── 1. Stress check (highest priority — deceptive deny) ──────
         if (mStressDetector.isProtectionActive()) {
@@ -107,6 +124,36 @@ public class ProtectionEngine {
                 return TransactionResult.fail(
                         TransactionResult.ERR_LIMIT_EXCEEDED,
                         "Lock screen limit: " + formatCents(lockLimit));
+            }
+        }
+
+        // ── 2.5. Secondary device spending limit ────────────────────
+        if (senderDeviceId != null && mLinkedDevicesProvider != null) {
+            java.util.Map<String, DeviceLink> devices = mLinkedDevicesProvider.get();
+            if (devices != null) {
+                DeviceLink link = devices.get(senderDeviceId);
+                if (link != null
+                        && link.role == DeviceLink.ROLE_SECONDARY
+                        && link.spendingLimitSats > 0) {
+                    // spendingLimitSats is in satoshis; 1 ₷ = 100 cents, 1 sat = 0.01 cents
+                    // treat spendingLimitSats as a per-tap cap in cents directly
+                    // (stored as cents internally despite the field name for UI clarity)
+                    long limitCents = link.spendingLimitSats;
+                    if (amountCents > limitCents) {
+                        Log.i(TAG, "Transfer blocked — secondary device limit"
+                                + " device=" + link.shortId()
+                                + " limit=" + formatCents(limitCents)
+                                + " requested=" + formatCents(amountCents));
+                        logEvent(ProtectionEvent.TYPE_LIMIT_BLOCK, amountCents,
+                                "secondary device " + link.shortId()
+                                        + " limit=" + formatCents(limitCents),
+                                null);
+                        return TransactionResult.fail(
+                                TransactionResult.ERR_LIMIT_EXCEEDED,
+                                "Device limit (" + (link.label != null ? link.label : link.shortId())
+                                        + "): " + formatCents(limitCents) + " per tap");
+                    }
+                }
             }
         }
 
@@ -192,6 +239,17 @@ public class ProtectionEngine {
     public void setPhase5Components(ProtectionLog log, CalibrationManager calibration) {
         mProtectionLog = log;
         mCalibration   = calibration;
+    }
+
+    /**
+     * Wire in Phase 6 linked devices provider so secondary device spending
+     * limits can be enforced at payment time.
+     *
+     * @param provider Returns the live linked-device map (keyed by deviceId).
+     */
+    public void setLinkedDevicesProvider(
+            java.util.function.Supplier<java.util.Map<String, DeviceLink>> provider) {
+        mLinkedDevicesProvider = provider;
     }
 
     /** User-reported false positive — adjusts calibration sensitivity. */

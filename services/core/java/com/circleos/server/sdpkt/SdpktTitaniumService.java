@@ -176,8 +176,9 @@ public class SdpktTitaniumService extends SystemService {
             mWearLinkManager = new WearLinkManager(getContext(), mStressDetector);
             mWearLinkManager.start();
 
-            // Phase 6 — load persisted linked devices
+            // Phase 6 — load persisted linked devices + wire spending limit enforcement
             loadLinkedDevices();
+            mProtectionEngine.setLinkedDevicesProvider(() -> mLinkedDevices);
 
             // Auto-initialize wallet if this is a fresh device
             if (!mKeyManager.hasKey()) {
@@ -235,7 +236,7 @@ public class SdpktTitaniumService extends SystemService {
             // ProtectionEngine.evaluateTransfer() also calls WalletStore.debit() on success.
             if (mProtectionEngine != null) {
                 TransactionResult gate = mProtectionEngine.evaluateTransfer(
-                        request.amountCents, request.lockScreenMode);
+                        request.amountCents, request.lockScreenMode, request.senderDeviceId);
                 if (!gate.success) {
                     // Return null — the calling app shows the appropriate error
                     Log.i(TAG, "Transfer gated by ProtectionEngine: " + gate.errorMessage);
