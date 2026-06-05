@@ -3040,6 +3040,40 @@ public final class SystemServer implements Dumpable {
                 com.circleos.server.privacy.CirclePrivacyManagerService.class);
         t.traceEnd();
 
+        // CircleOS: 6 sibling services -- update, permission, analytics,
+        // camera_privacy, clipboard_privacy, notification_privacy, backup.
+        // Each registers a real binder backed by a real implementation
+        // (no placeholders). Order doesn't matter -- they don't depend
+        // on each other for onStart wiring.
+        t.traceBegin("StartCircleUpdateService");
+        mSystemServiceManager.startService(
+                com.circleos.server.update.CircleUpdateService.class);
+        t.traceEnd();
+        t.traceBegin("StartCirclePermissionService");
+        mSystemServiceManager.startService(
+                com.circleos.server.permission.CirclePermissionService.class);
+        t.traceEnd();
+        t.traceBegin("StartCircleAnalyticsService");
+        mSystemServiceManager.startService(
+                com.circleos.server.analytics.CircleAnalyticsService.class);
+        t.traceEnd();
+        t.traceBegin("StartCircleCameraPrivacyService");
+        mSystemServiceManager.startService(
+                com.circleos.server.camera.CircleCameraPrivacyService.class);
+        t.traceEnd();
+        t.traceBegin("StartCircleClipboardPrivacyService");
+        mSystemServiceManager.startService(
+                com.circleos.server.clipboard.CircleClipboardPrivacyService.class);
+        t.traceEnd();
+        t.traceBegin("StartCircleNotificationPrivacyService");
+        mSystemServiceManager.startService(
+                com.circleos.server.notification.CircleNotificationPrivacyService.class);
+        t.traceEnd();
+        t.traceBegin("StartCircleBackupService");
+        mSystemServiceManager.startService(
+                com.circleos.server.backup.CircleBackupService.class);
+        t.traceEnd();
+
         t.traceBegin("MakePackageManagerServiceReady");
         mPackageManagerService.systemReady();
         t.traceEnd();
