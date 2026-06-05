@@ -3032,6 +3032,14 @@ public final class SystemServer implements Dumpable {
         mSystemServiceManager.startService(PermissionPolicyService.class);
         t.traceEnd();
 
+        // CircleOS: Privacy Engine. Must be up before
+        // PHASE_THIRD_PARTY_APPS_CAN_START so the first user APK launch
+        // hits the deny-by-default privacy gate.
+        t.traceBegin("StartCirclePrivacyManagerService");
+        mSystemServiceManager.startService(
+                com.circleos.server.privacy.CirclePrivacyManagerService.class);
+        t.traceEnd();
+
         t.traceBegin("MakePackageManagerServiceReady");
         mPackageManagerService.systemReady();
         t.traceEnd();
