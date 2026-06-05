@@ -3074,6 +3074,14 @@ public final class SystemServer implements Dumpable {
                 com.circleos.server.backup.CircleBackupService.class);
         t.traceEnd();
 
+        // CircleOS: Mesh service -- WiFi P2P + BLE discovery + send.
+        // Registered last so the other privacy bits are up before the
+        // first peer-discovery callback could try to touch them.
+        t.traceBegin("StartCircleMeshService");
+        mSystemServiceManager.startService(
+                com.circleos.server.mesh.CircleMeshService.class);
+        t.traceEnd();
+
         t.traceBegin("MakePackageManagerServiceReady");
         mPackageManagerService.systemReady();
         t.traceEnd();

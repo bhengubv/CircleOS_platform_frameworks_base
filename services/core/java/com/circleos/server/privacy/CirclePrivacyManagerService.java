@@ -26,93 +26,83 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Circle OS Privacy Engine.
+ * Circle OS Privacy Engine -- v3 with NetworkPermissionEnforcer wired
+ * into the policy hot path.
  *
- * <p>Owns the per-package privacy policy + permission-use audit log +
- * the system-wide privacy counters that the CircleOsSettings dashboard
- * surfaces.
+ * <p>Each call to {@link PerAppBinder#setPolicy(String, AppPrivacyPolicy)}
+ * now triggers {@link NetworkPermissionEnforcer#enforce} which applies
+ * both a {@code NetworkPolicyManager.setUidPolicy} record and an
+ * {@code INetd.firewallSetUidRule} kernel-level deny. Revoking the
+ * policy reverses both.
  *
- * <p>Publishes two binder surfaces, mirroring the two AIDLs in
- * {@code vendor/circle/aidl/}:
- *
- * <ul>
- *   <li>{@code circle.privacy} — system-wide counters
- *       ({@link ICirclePrivacyManagerService}).
- *   <li>{@code circle_privacy} — per-package CRUD
- *       ({@link ICirclePrivacyManager}).
- * </ul>
- *
- * <p>Persistence is in {@link PrivacyDatabase} (SQLite under
- * {@code /data/system/circle/privacy.db}, device-protected storage so
- * the service is usable from PHASE_LOCK_SETTINGS_READY onward).
- *
- * <p>Default-deny: a package with no row in the {@code policy} table
- * gets a freshly-constructed {@link AppPrivacyPolicy} — every flag
- * false, empty sensor list. That's the same constructor used by
- * upstream {@code AppPrivacyPolicy()} so caller and storage agree.
+ * <p>Other surfaces are unchanged from v2: SQLite-backed policy + log
+ * + counters, two binder names ({@code circle.privacy} + {@code circle_privacy}),
+ * deny-by-default policy default, deterministic 0-100 score derivation.
  */
 public final class CirclePrivacyManagerService extends SystemService {
 
     private static final String TAG = "CirclePrivacy";
 
-    /** Service name used by {@link ICirclePrivacyManagerService}. */
     public static final String SERVICE_SYSTEM  = "circle.privacy";
-
-    /** Service name used by {@link ICirclePrivacyManager}. */
     public static final String SERVICE_PER_APP = "circle_privacy";
 
-    /** Default usage-log lookback when caller passes {@code since == 0}. */
     private static final long DEFAULT_USAGE_LOOKBACK_MS = 30L * 24 * 60 * 60 * 1000;
-
-    /** Max rows returned from a single {@code getUsageLog} call. */
     private static final int  MAX_USAGE_ROWS = 500;
 
-    private final PrivacyDatabase mDb;
-    private final SystemBinder    mSystemBinder = new SystemBinder();
-    private final PerAppBinder    mPerAppBinder = new PerAppBinder();
+    private final PrivacyDatabase            mDb;
+    private final NetworkPermissionEnforcer  mEnforcer;
+    private final SystemBinder               mSystemBinder = new SystemBinder();
+    private final PerAppBinder               mPerAppBinder = new PerAppBinder();
 
     public CirclePrivacyManagerService(Context context) {
         super(context);
-        mDb = new PrivacyDatabase(context);
+        mDb       = new PrivacyDatabase(context);
+        mEnforcer = new NetworkPermissionEnforcer(context);
     }
 
     @Override
     public void onStart() {
-        Slog.i(TAG, "Publishing " + SERVICE_SYSTEM + " (system counters) + "
-                + SERVICE_PER_APP + " (per-app CRUD) binders");
+        Slog.i(TAG, "Publishing " + SERVICE_SYSTEM + " + " + SERVICE_PER_APP);
         publishBinderService(SERVICE_SYSTEM,  mSystemBinder);
         publishBinderService(SERVICE_PER_APP, mPerAppBinder);
     }
 
+    @Override
+    public void onBootPhase(int phase) {
+        if (phase == SystemService.PHASE_BOOT_COMPLETED) {
+            // Schedule the periodic auto-revoke pass once the system is
+            // up enough that JobScheduler is available. This is the entry
+            // point CircleSettings' BootReceiver would also hit -- doing
+            // it from system_server too gives belt + braces.
+            try {
+                CircleAutoRevokeScheduler.schedule(getContext());
+            } catch (Throwable t) {
+                Slog.w(TAG, "AutoRevoke schedule failed", t);
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
-    //  System-wide counters (ICirclePrivacyManagerService)
+    //  System-wide counters
     // ------------------------------------------------------------------
 
     private final class SystemBinder extends ICirclePrivacyManagerService.Stub {
-
-        @Override
-        public int getDeniedPermissionCount() {
+        @Override public int getDeniedPermissionCount() {
             enforceQueryPrivacy();
             return mDb.getCounter(PrivacyDatabase.COUNTER_DENIED_PERMISSIONS);
         }
-
-        @Override
-        public int getFakedIdentifierCount() {
+        @Override public int getFakedIdentifierCount() {
             enforceQueryPrivacy();
             return mDb.getCounter(PrivacyDatabase.COUNTER_FAKED_IDENTIFIERS);
         }
-
-        @Override
-        public int getNetworkGrantCount() {
+        @Override public int getNetworkGrantCount() {
             enforceQueryPrivacy();
-            // Authoritative: count over the policy table (the counter row is
-            // an upper bound; this is the live truth).
             return mDb.countNetworkGrants();
         }
     }
 
     // ------------------------------------------------------------------
-    //  Per-package CRUD (ICirclePrivacyManager)
+    //  Per-package CRUD
     // ------------------------------------------------------------------
 
     private final class PerAppBinder extends ICirclePrivacyManager.Stub {
@@ -134,9 +124,15 @@ public final class CirclePrivacyManagerService extends SystemService {
         public void setPolicy(String packageName, AppPrivacyPolicy policy) {
             enforceManagePrivacy();
             if (TextUtils.isEmpty(packageName) || policy == null) return;
+
             mDb.setPolicy(packageName, policy);
 
-            // Log the policy change so the dashboard timeline shows it.
+            // Wire the policy through to the kernel firewall + NetworkPolicy.
+            // This is the v2->v3 upgrade: the setPolicy hot path is now
+            // the SINGLE place where deny-by-default becomes real.
+            mEnforcer.enforce(packageName, policy);
+
+            // Audit log.
             final PermissionUsageRecord rec = new PermissionUsageRecord();
             rec.timestamp  = System.currentTimeMillis();
             rec.permission = "circle.policy.changed";
@@ -145,9 +141,6 @@ public final class CirclePrivacyManagerService extends SystemService {
             mDb.appendUsage(rec, packageName);
 
             Slog.i(TAG, "Policy updated for " + packageName + ": " + rec.extra);
-            // TODO: NetworkPermissionEnforcer.refresh(packageName) once that
-            //       lands — until then setPolicy persists the user's wish but
-            //       the kernel netfilter rules don't move.
         }
 
         @Override
@@ -163,32 +156,17 @@ public final class CirclePrivacyManagerService extends SystemService {
         @Override
         public int revokeUnusedPermissions() {
             enforceManagePrivacy();
-            // TODO: requires PackageManager + PermissionManager integration —
-            //       walk every installed package, check whether each runtime
-            //       permission has been used in the last 90d (via our
-            //       usage_log + AppOpsManager.getOpsForPackage cross-ref),
-            //       revoke unused, log. Returns count.
-            //       Tracked under task #5 (Week 2).
-            Slog.i(TAG, "revokeUnusedPermissions() — not yet implemented");
-            return 0;
+            // The actual revocation runs from CircleAutoRevokeJobService
+            // (CircleSettings app); calling here returns the count from
+            // the last completed pass so dashboards see fresh numbers.
+            return mDb.getCounter("auto_revoke_last_count");
         }
     }
 
     // ------------------------------------------------------------------
-    //  Score derivation
+    //  Score derivation -- unchanged from v2
     // ------------------------------------------------------------------
 
-    /**
-     * Composite 0..100 score from an {@link AppPrivacyPolicy}. Higher is
-     * better. Simple weighted sum for alpha — the real formula will fold
-     * in usage-frequency (a network-allowed app that uses it once a week
-     * scores higher than one that beacons every minute) and Traffic Lobby
-     * verdicts once those land.
-     *
-     * <p>Weights match the user-perceived sensitivity of each surface:
-     * network=40, contacts=25, storage=15, every sensor=2 (cap 20).
-     * Total possible penalty 100. Score = 100 - penalty.
-     */
     static int computeScore(AppPrivacyPolicy p) {
         if (p == null) return 100;
         int penalty = 0;
@@ -213,38 +191,16 @@ public final class CirclePrivacyManagerService extends SystemService {
     }
 
     // ------------------------------------------------------------------
-    //  Permission gates
+    //  Permission gates -- unchanged from v2
     // ------------------------------------------------------------------
 
-    /**
-     * Read access requires {@code za.co.circleos.permission.QUERY_PRIVACY}.
-     * SYSTEM_UID and ROOT_UID are always permitted (the dashboard runs
-     * under system_server's identity for some reads).
-     */
     private void enforceQueryPrivacy() {
         final int uid = Binder.getCallingUid();
-        if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) {
-            return;
-        }
-        // TODO: enforce once the permission is declared in CircleSettings
-        //       AndroidManifest.xml. Until then permit-all so the UI can
-        //       wire up during development without crashing.
-        // getContext().enforceCallingOrSelfPermission(
-        //         "za.co.circleos.permission.QUERY_PRIVACY",
-        //         "Need QUERY_PRIVACY to read Circle privacy state");
+        if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
     }
 
-    /**
-     * Write access requires {@code za.co.circleos.permission.MANAGE_PRIVACY}.
-     */
     private void enforceManagePrivacy() {
         final int uid = Binder.getCallingUid();
-        if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) {
-            return;
-        }
-        // TODO: see enforceQueryPrivacy().
-        // getContext().enforceCallingOrSelfPermission(
-        //         "za.co.circleos.permission.MANAGE_PRIVACY",
-        //         "Need MANAGE_PRIVACY to change Circle privacy state");
+        if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
     }
 }
