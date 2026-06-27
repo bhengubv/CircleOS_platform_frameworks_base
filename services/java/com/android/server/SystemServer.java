@@ -3049,6 +3049,11 @@ public final class SystemServer implements Dumpable {
         mSystemServiceManager.startService(
                 com.circleos.server.update.CircleUpdateService.class);
         t.traceEnd();
+
+        t.traceBegin("StartCircleCrashReporter");
+        mSystemServiceManager.startService(
+                com.circleos.server.update.CrashReporter.class);
+        t.traceEnd();
         t.traceBegin("StartCirclePermissionService");
         mSystemServiceManager.startService(
                 com.circleos.server.permission.CirclePermissionService.class);
