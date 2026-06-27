@@ -1808,6 +1808,29 @@
         android:description="@string/permdesc_cameraOpenCloseListener"
         android:protectionLevel="signature" />
 
+    <!-- ===== Circle OS platform permissions (#142). Signature-only: held by
+         platform-signed Circle apps/services. ===== -->
+    <!-- Send a message through / query the CircleMeshService (circle.mesh). -->
+    <permission android:name="android.permission.CIRCLE_MESH_SEND"
+        android:protectionLevel="signature" />
+    <permission android:name="android.permission.CIRCLE_MESH_QUERY"
+        android:protectionLevel="signature" />
+    <!-- Quarantine a file (circle.quarantine); used by the TrafficLobby VPN. -->
+    <permission android:name="android.permission.CIRCLE_SECURITY_QUARANTINE"
+        android:protectionLevel="signature" />
+    <!-- OTA control plane (CircleUpdateService). -->
+    <permission android:name="za.co.circleos.permission.MANAGE_OTA"
+        android:protectionLevel="signature" />
+    <permission android:name="za.co.circleos.permission.QUERY_OTA"
+        android:protectionLevel="signature" />
+    <permission android:name="za.co.circleos.permission.TRIGGER_OTA"
+        android:protectionLevel="signature" />
+    <!-- Privacy control plane (CirclePrivacyManagerService / CirclePermissionService). -->
+    <permission android:name="za.co.circleos.permission.MANAGE_PRIVACY"
+        android:protectionLevel="signature" />
+    <permission android:name="za.co.circleos.permission.QUERY_PRIVACY"
+        android:protectionLevel="signature" />
+
     <!-- @SystemApi Allows camera access by Headless System User 0 when device is running in
             HSUM Mode.
          @FlaggedApi("com.android.internal.camera.flags.camera_hsum_permission")
@@ -8809,6 +8832,13 @@
     <permission android:name="android.permission.ACCESS_TEXT_CLASSIFIER_BY_TYPE"
         android:protectionLevel="signature|role"
         android:featureFlag="android.permission.flags.text_classifier_choice_api_enabled"/>
+
+    <!-- Allows an application to spoof its package signature.
+         Used by microG to present as Google Play Services.
+         @hide
+    -->
+    <permission android:name="android.permission.FAKE_PACKAGE_SIGNATURE"
+        android:protectionLevel="signature|privileged"/>
 
     <!-- Attribution for Geofencing service. -->
     <attribution android:tag="GeofencingService" android:label="@string/geofencing_service"/>
