@@ -316,12 +316,20 @@ public final class CircleBackupService extends SystemService {
     private void enforceQuery() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on za.co.circleos.permission.QUERY_PRIVACY.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("za.co.circleos.permission.QUERY_PRIVACY", "circle-api");
     }
 
     private void enforceManage() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on za.co.circleos.permission.MANAGE_PRIVACY.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("za.co.circleos.permission.MANAGE_PRIVACY", "circle-api");
     }
 }

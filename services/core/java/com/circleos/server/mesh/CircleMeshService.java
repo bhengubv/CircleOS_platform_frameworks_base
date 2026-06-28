@@ -604,13 +604,21 @@ public final class CircleMeshService extends SystemService {
     private void enforceQuery() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on android.permission.CIRCLE_MESH_QUERY once declared.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("android.permission.CIRCLE_MESH_QUERY", "circle-api");
     }
 
     private void enforceSend() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on android.permission.CIRCLE_MESH_SEND once declared.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("android.permission.CIRCLE_MESH_SEND", "circle-api");
     }
 
     // ------------------------------------------------------------------

@@ -341,18 +341,30 @@ public final class CircleUpdateService extends SystemService {
     private void enforceQueryOta() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on za.co.circleos.permission.QUERY_OTA once declared.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("za.co.circleos.permission.QUERY_OTA", "circle-api");
     }
 
     private void enforceTriggerOta() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on za.co.circleos.permission.TRIGGER_OTA once declared.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("za.co.circleos.permission.TRIGGER_OTA", "circle-api");
     }
 
     private void enforceManageOta() {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
-        // TODO: gate on za.co.circleos.permission.MANAGE_OTA once declared.
+        // Allow system + any platform-signed Circle app; otherwise require the permission.
+        if (getContext().getPackageManager().checkSignatures(
+                android.os.Binder.getCallingUid(), android.os.Process.SYSTEM_UID)
+                        == android.content.pm.PackageManager.SIGNATURE_MATCH) return;
+        getContext().enforceCallingOrSelfPermission("za.co.circleos.permission.MANAGE_OTA", "circle-api");
     }
 }
