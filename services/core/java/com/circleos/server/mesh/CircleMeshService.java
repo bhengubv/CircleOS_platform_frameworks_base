@@ -96,6 +96,13 @@ public final class CircleMeshService extends SystemService {
     /** Peer staleness threshold -- drop peer if not seen in this long. */
     private static final long PEER_STALENESS_MS = 90_000;
 
+    /** Metadata-hardened wire framing: the content type is never on the wire
+     *  (the E2E payload self-describes via its CKX/CE1/CE2 prefix), and each
+     *  frame is zero-padded up to a coarse size bucket so an observer learns
+     *  only [version][bucketed length] -- not the message type or true size. */
+    private static final int FRAME_VERSION = 2;
+    private static final int[] FRAME_BUCKETS = {256, 512, 1024, 2048, 4096, 8192, 16384};
+
     private final Context mContext;
     private final MeshBinder mBinder = new MeshBinder();
     private final HandlerThread mWorker = new HandlerThread("CircleMesh");
@@ -320,7 +327,9 @@ public final class CircleMeshService extends SystemService {
     // ------------------------------------------------------------------
 
     private void dispatchMessage(Peer p, byte[] payload, int msgType) {
-        // For alpha-1: the wire framing is [4 bytes BE msgType][payload].
+        // Metadata-hardened framing v2: [ver][trueLen][payload + size-bucket
+        // padding]. The content type is NOT on the wire; a relay sees only a
+        // padded opaque blob.
         // The full mesh message format (chapter 18) -- with sender id,
         // signature, hop count, TTL, dedup id -- lands in the alpha-2
         // crypto pass. Today's two consumers (Butler chat, CircleMessages)
@@ -339,12 +348,20 @@ public final class CircleMeshService extends SystemService {
     }
 
     private static byte[] frameMessage(byte[] payload, int msgType) {
-        final byte[] out = new byte[4 + payload.length];
-        out[0] = (byte) ((msgType >> 24) & 0xff);
-        out[1] = (byte) ((msgType >> 16) & 0xff);
-        out[2] = (byte) ((msgType >> 8) & 0xff);
-        out[3] = (byte) (msgType & 0xff);
-        System.arraycopy(payload, 0, out, 4, payload.length);
+        // msgType is intentionally NOT written to the wire (blind-to-us: the
+        // encrypted payload already self-describes its type). Header is
+        // [ver:1][trueLen:4 BE]; the frame is then zero-padded to a size bucket.
+        final int header = 5;
+        final int target = header + payload.length;
+        int bucket = target;
+        for (int b : FRAME_BUCKETS) { if (b >= target) { bucket = b; break; } }
+        final byte[] out = new byte[bucket];
+        out[0] = (byte) FRAME_VERSION;
+        out[1] = (byte) ((payload.length >> 24) & 0xff);
+        out[2] = (byte) ((payload.length >> 16) & 0xff);
+        out[3] = (byte) ((payload.length >> 8) & 0xff);
+        out[4] = (byte) (payload.length & 0xff);
+        System.arraycopy(payload, 0, out, header, payload.length);
         return out;
     }
 
