@@ -219,7 +219,7 @@ public final class CircleMeshService extends SystemService {
                 return;
             }
             final ScanFilter filter = new ScanFilter.Builder()
-                    .setServiceUuid(new ParcelUuid(CIRCLE_MESH_BLE_SVC_UUID))
+                    .setServiceUuid(new ParcelUuid(currentServiceUuid()))
                     .build();
             final ScanSettings settings = new ScanSettings.Builder()
                     .setScanMode(ScanSettings.SCAN_MODE_LOW_POWER)
@@ -394,7 +394,7 @@ public final class CircleMeshService extends SystemService {
                 @Override
                 public void onServicesDiscovered(android.bluetooth.BluetoothGatt gatt, int status) {
                     final android.bluetooth.BluetoothGattService svc =
-                            gatt.getService(CIRCLE_MESH_BLE_SVC_UUID);
+                            gatt.getService(currentServiceUuid());
                     if (svc == null) {
                         Slog.w(TAG, "sendViaBle: peer has no Circle service");
                         gatt.close();
@@ -407,7 +407,12 @@ public final class CircleMeshService extends SystemService {
                         gatt.close();
                         return;
                     }
-                    ch.setValue(frame);
+                    // Link-layer encrypt: the envelope is opaque on the air to any
+                    // non-Circle observer (defeats fingerprinting + metadata capture).
+                    final byte[] wire = MeshLinkPrivacy.linkEncrypt(
+                            MeshLinkPrivacy.currentEpoch(System.currentTimeMillis()), frame);
+                    if (wire == null) { gatt.close(); return; }
+                    ch.setValue(wire);
                     try {
                         gatt.writeCharacteristic(ch);
                     } catch (SecurityException se) {
@@ -448,6 +453,12 @@ public final class CircleMeshService extends SystemService {
     // ------------------------------------------------------------------
     //  Helpers
     // ------------------------------------------------------------------
+
+    /** Current rotating BLE service UUID (daily; unguessable without the network key),
+     *  so a passive scanner can't fingerprint the device as Circle. */
+    private UUID currentServiceUuid() {
+        return MeshLinkPrivacy.serviceUuid(MeshLinkPrivacy.currentEpoch(System.currentTimeMillis()));
+    }
 
     private static String generateDeviceId() {
         final byte[] b = new byte[8];
