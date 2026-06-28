@@ -122,6 +122,10 @@ public final class CircleMeshService extends SystemService {
 
     private WifiP2pManager     mWifiP2p;
     private WifiP2pManager.Channel mWifiChannel;
+    private static final int WIFI_PORT = 8988;
+    private volatile java.net.ServerSocket mWifiServer;
+    private final java.util.concurrent.ConcurrentLinkedQueue<byte[]> mWifiOutbox =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
     private BluetoothAdapter   mBtAdapter;
     private BluetoothLeScanner mBleScanner;
     private final ScanCallback mBleScanCb = new BleScanHandler();
@@ -166,6 +170,7 @@ public final class CircleMeshService extends SystemService {
             }
             mWifiChannel = mWifiP2p.initialize(mContext, Looper.getMainLooper(), null);
             triggerWifiP2pDiscovery();
+            startWifiP2pServer();
         } catch (Throwable t) {
             Slog.w(TAG, "Wifi P2P bring-up failed -- transport disabled", t);
             mWifiP2p = null;
@@ -448,17 +453,102 @@ public final class CircleMeshService extends SystemService {
         }
     }
 
+    /**
+     * Opportunistic Wi-Fi Direct send. The frame is a self-describing routed v3
+     * envelope, so we queue it and push it to the group owner over TCP as soon as
+     * a P2P group is up (this device as client). If no group exists we kick off
+     * formation toward the peer; queued frames flush on the next attempt. High
+     * bandwidth when available; BLE remains the always-on path.
+     */
     private void sendViaWifiP2p(Peer p, byte[] frame) {
-        // WiFi P2P direct send requires forming a group with the peer
-        // (WifiP2pManager.connect) then opening a TCP socket to the
-        // group owner. The connect flow is async and intrusive (it
-        // disconnects existing groups). For alpha-1 we log + drop;
-        // CircleMessages will fall back to BLE when both transports
-        // know the peer. WifiP2p sends land with the file-transfer
-        // surface in alpha-2.
-        Slog.i(TAG, "wifi-p2p send to " + p.shortId
-                + " queued (" + frame.length + " bytes) -- direct group"
-                + " formation not wired in alpha-1");
+        if (mWifiP2p == null || mWifiChannel == null || frame == null) return;
+        mWifiOutbox.offer(frame);
+        while (mWifiOutbox.size() > 64) mWifiOutbox.poll(); // bound the backlog
+        final String addr = (p == null) ? null : p.address;
+        try {
+            mWifiP2p.requestConnectionInfo(mWifiChannel, info -> {
+                if (info != null && info.groupFormed) {
+                    flushWifiOutbox(info);
+                } else if (addr != null) {
+                    formWifiGroup(addr); // no group yet -> form one; flush on next send
+                }
+            });
+        } catch (Throwable t) {
+            Slog.w(TAG, "wifi-p2p send threw", t);
+        }
+    }
+
+    /** Drain the outbox to the group owner over TCP (only the client can push). */
+    private void flushWifiOutbox(android.net.wifi.p2p.WifiP2pInfo info) {
+        if (info == null || !info.groupFormed || info.isGroupOwner
+                || info.groupOwnerAddress == null) {
+            return; // group owner receives via the ServerSocket; it cannot initiate
+        }
+        byte[] frame;
+        while ((frame = mWifiOutbox.poll()) != null) {
+            java.net.Socket sock = new java.net.Socket();
+            try {
+                sock.connect(new java.net.InetSocketAddress(
+                        info.groupOwnerAddress, WIFI_PORT), 5000);
+                java.io.DataOutputStream out =
+                        new java.io.DataOutputStream(sock.getOutputStream());
+                out.writeInt(frame.length);
+                out.write(frame);
+                out.flush();
+            } catch (Throwable t) {
+                Slog.w(TAG, "wifi-p2p socket send failed", t);
+                mWifiOutbox.offer(frame); // requeue; retry on the next attempt
+                break;
+            } finally {
+                try { sock.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    /** Form a P2P group toward a peer so subsequent sends have a path. */
+    private void formWifiGroup(String deviceAddress) {
+        try {
+            android.net.wifi.p2p.WifiP2pConfig cfg = new android.net.wifi.p2p.WifiP2pConfig();
+            cfg.deviceAddress = deviceAddress;
+            mWifiP2p.connect(mWifiChannel, cfg, new WifiP2pManager.ActionListener() {
+                @Override public void onSuccess() { /* flushes on next send */ }
+                @Override public void onFailure(int reason) {
+                    Slog.i(TAG, "wifi-p2p connect failed: " + reason);
+                }
+            });
+        } catch (Throwable t) {
+            Slog.w(TAG, "wifi-p2p connect threw", t);
+        }
+    }
+
+    /** Receive loop: as group owner, accept TCP frames and feed the router path. */
+    private void startWifiP2pServer() {
+        if (mWifiServer != null) return;
+        Thread t = new Thread(() -> {
+            try {
+                mWifiServer = new java.net.ServerSocket(WIFI_PORT);
+                while (mWifiServer != null && !mWifiServer.isClosed()) {
+                    java.net.Socket sock = mWifiServer.accept();
+                    try {
+                        java.io.DataInputStream in =
+                                new java.io.DataInputStream(sock.getInputStream());
+                        int len = in.readInt();
+                        if (len > 0 && len <= (1 << 20)) {
+                            byte[] frame = new byte[len];
+                            in.readFully(frame);
+                            deliverReceived(null, frame); // routed frame is self-describing
+                        }
+                    } catch (Throwable ignored) {
+                    } finally {
+                        try { sock.close(); } catch (Throwable ignored2) {}
+                    }
+                }
+            } catch (Throwable t2) {
+                Slog.w(TAG, "wifi-p2p server stopped", t2);
+            }
+        }, "CircleMeshWifiServer");
+        t.setDaemon(true);
+        t.start();
     }
 
     // ------------------------------------------------------------------
