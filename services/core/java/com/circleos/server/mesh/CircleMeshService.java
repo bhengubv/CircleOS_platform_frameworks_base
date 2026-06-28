@@ -126,6 +126,9 @@ public final class CircleMeshService extends SystemService {
     private volatile java.net.ServerSocket mWifiServer;
     private final java.util.concurrent.ConcurrentLinkedQueue<byte[]> mWifiOutbox =
             new java.util.concurrent.ConcurrentLinkedQueue<>();
+    /** Store-and-forward: frames held when no peer is reachable; flushed on discovery. */
+    private final java.util.concurrent.ConcurrentLinkedQueue<byte[]> mMeshOutbox =
+            new java.util.concurrent.ConcurrentLinkedQueue<>();
     private BluetoothAdapter   mBtAdapter;
     private BluetoothLeScanner mBleScanner;
     private final ScanCallback mBleScanCb = new BleScanHandler();
@@ -205,6 +208,7 @@ public final class CircleMeshService extends SystemService {
             mPeers.put(key, new Peer(key, d.deviceName, Transport.WIFI_P2P,
                     d.deviceAddress, null, now));
         }
+        if (!mMeshOutbox.isEmpty()) flushMeshOutbox();
     }
 
     private void startBle() {
@@ -259,6 +263,7 @@ public final class CircleMeshService extends SystemService {
                     d.getAddress(),
                     d,
                     now));
+            if (!mMeshOutbox.isEmpty()) flushMeshOutbox();
         }
 
         @Override
@@ -327,7 +332,9 @@ public final class CircleMeshService extends SystemService {
             mHandler.post(() -> {
                 final byte[] frame = padToBucket(mRouter.encode(
                         MeshRouter.idToBytes(dstId), myIdBytes(), MeshRouter.DEFAULT_TTL, pl));
-                if (direct != null) {
+                if (mPeers.isEmpty()) {
+                    storeForLater(frame); // no peer in range -> carry until we meet one
+                } else if (direct != null) {
                     if (direct.transport == Transport.BLE) sendViaBle(direct, frame);
                     else sendViaWifiP2p(direct, frame);
                 } else {
@@ -387,8 +394,8 @@ public final class CircleMeshService extends SystemService {
         // sequence is async and would tie up the worker thread for
         // up to several seconds per send. For alpha-1 we initiate the
         // connect+write and rely on the OS's gatt callback flow; failures
-        // are logged and the message is dropped (no store-and-forward
-        // yet -- that lands with the v2 AIDL that exposes IMessageReceiver).
+        // are logged, but the router floods to other peers and frames with
+        // no reachable peer are held by the mesh outbox (store-and-forward).
         if (p.btDevice == null) {
             Slog.w(TAG, "sendViaBle: no BluetoothDevice cached for " + p.shortId);
             return;
@@ -684,6 +691,22 @@ public final class CircleMeshService extends SystemService {
                 else sendViaWifiP2p(peer, frame);
             } catch (Throwable ignored) {}
         }
+    }
+
+    /** Hold a frame we couldn't send (no peers) until one is discovered. */
+    private void storeForLater(byte[] frame) {
+        mMeshOutbox.offer(frame);
+        while (mMeshOutbox.size() > 128) mMeshOutbox.poll(); // bound; drop oldest
+        Slog.i(TAG, "mesh: stored frame for later (" + mMeshOutbox.size() + " queued)");
+    }
+
+    /** Flush stored frames once a peer appears -- the carry-until-you-meet step. */
+    private void flushMeshOutbox() {
+        if (mMeshOutbox.isEmpty() || mPeers.isEmpty()) return;
+        byte[] frame;
+        int n = 0;
+        while ((frame = mMeshOutbox.poll()) != null) { relayToAll(frame); n++; }
+        if (n > 0) Slog.i(TAG, "mesh: flushed " + n + " stored frame(s) on peer discovery");
     }
 
     private void broadcastReceived(String sender, byte[] payload) {
