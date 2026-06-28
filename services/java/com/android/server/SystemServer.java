@@ -3083,6 +3083,10 @@ public final class SystemServer implements Dumpable {
         mSystemServiceManager.startService(
                 com.circleos.server.backup.CircleBackupService.class);
         t.traceEnd();
+        t.traceBegin("StartShongololoWalletService");
+        mSystemServiceManager.startService(
+                com.circleos.server.wallet.ShongololoWalletService.class);
+        t.traceEnd();
 
         // CircleOS: Mesh service -- WiFi P2P + BLE discovery + send.
         // Registered last so the other privacy bits are up before the
