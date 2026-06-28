@@ -103,6 +103,9 @@ public final class CircleMeshService extends SystemService {
     private static final int FRAME_VERSION = 2;
     private static final int[] FRAME_BUCKETS = {256, 512, 1024, 2048, 4096, 8192, 16384};
 
+    /** Multi-hop store-and-forward routing (v3 frames). */
+    private final MeshRouter mRouter = new MeshRouter(512);
+
     private final Context mContext;
     private final MeshBinder mBinder = new MeshBinder();
     private final HandlerThread mWorker = new HandlerThread("CircleMesh");
@@ -312,14 +315,20 @@ public final class CircleMeshService extends SystemService {
         public boolean sendMessage(String recipientDeviceId, byte[] payload, int msgType) {
             enforceSend();
             if (TextUtils.isEmpty(recipientDeviceId) || payload == null) return false;
-            final Peer p = mPeers.get(recipientDeviceId);
-            if (p == null) {
-                Slog.i(TAG, "sendMessage: unknown peer " + recipientDeviceId);
-                return false;
-            }
-            // We dispatch to the worker so the caller's binder thread
-            // never blocks on a transport that may need real I/O.
-            mHandler.post(() -> dispatchMessage(p, payload, msgType));
+            final Peer direct = mPeers.get(recipientDeviceId);
+            final byte[] pl = payload;
+            final String dstId = recipientDeviceId;
+            // Worker thread so the binder caller never blocks on transport I/O.
+            mHandler.post(() -> {
+                final byte[] frame = padToBucket(mRouter.encode(
+                        MeshRouter.idToBytes(dstId), myIdBytes(), MeshRouter.DEFAULT_TTL, pl));
+                if (direct != null) {
+                    if (direct.transport == Transport.BLE) sendViaBle(direct, frame);
+                    else sendViaWifiP2p(direct, frame);
+                } else {
+                    relayToAll(frame); // recipient not in direct range -> multi-hop flood
+                }
+            });
             return true;
         }
     }
@@ -546,21 +555,18 @@ public final class CircleMeshService extends SystemService {
         byte[] frame = MeshLinkPrivacy.linkDecrypt(
                 MeshLinkPrivacy.currentEpoch(System.currentTimeMillis()), wire);
         if (frame == null) { Slog.i(TAG, "drop: not a Circle link frame"); return; }
-        byte[] payload = unframe(frame);
-        if (payload == null) return;
-        final String sender = shortIdFromMac(device == null ? "" : device.getAddress());
-        final String text = new String(payload, java.nio.charset.StandardCharsets.UTF_8);
-        android.content.Intent i =
-                new android.content.Intent("za.co.circleos.mesh.action.MESSAGE_RECEIVED");
-        i.putExtra("sender_id", sender);
-        i.putExtra("msg_text", text);
-        i.setFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-        try {
-            mContext.sendBroadcastAsUser(i, android.os.UserHandle.ALL);
-        } catch (Throwable t) {
-            mContext.sendBroadcast(i);
+        MeshRouter.Parsed p = mRouter.decode(frame);
+        if (p == null) return;
+        switch (mRouter.route(p, myIdBytes())) {
+            case DELIVER:
+                broadcastReceived(MeshRouter.bytesToId(p.src), p.payload);
+                break;
+            case RELAY:
+                relayToAll(padToBucket(mRouter.reframeForRelay(p)));
+                break;
+            default:
+                break; // DROP (duplicate / TTL-exhausted)
         }
-        Slog.i(TAG, "delivered mesh message from " + sender + " (" + payload.length + "b)");
     }
 
     /** Reverse frameMessage v2: [ver][trueLen:4 BE][payload][padding] -> payload. */
@@ -570,6 +576,36 @@ public final class CircleMeshService extends SystemService {
                 | ((frame[3] & 0xff) << 8) | (frame[4] & 0xff);
         if (len < 0 || 5 + len > frame.length) return null;
         return java.util.Arrays.copyOfRange(frame, 5, 5 + len);
+    }
+
+    private byte[] myIdBytes() { return MeshRouter.idToBytes(mDeviceId); }
+
+    private static byte[] padToBucket(byte[] frame) {
+        int bucket = frame.length;
+        for (int b : FRAME_BUCKETS) { if (b >= frame.length) { bucket = b; break; } }
+        return bucket == frame.length ? frame : java.util.Arrays.copyOf(frame, bucket);
+    }
+
+    /** Forward a frame to every known peer; the router's dedup prevents loops. */
+    private void relayToAll(byte[] frame) {
+        for (Peer peer : mPeers.values()) {
+            try {
+                if (peer.transport == Transport.BLE) sendViaBle(peer, frame);
+                else sendViaWifiP2p(peer, frame);
+            } catch (Throwable ignored) {}
+        }
+    }
+
+    private void broadcastReceived(String sender, byte[] payload) {
+        final String text = new String(payload, java.nio.charset.StandardCharsets.UTF_8);
+        android.content.Intent i =
+                new android.content.Intent("za.co.circleos.mesh.action.MESSAGE_RECEIVED");
+        i.putExtra("sender_id", sender);
+        i.putExtra("msg_text", text);
+        i.setFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+        try { mContext.sendBroadcastAsUser(i, android.os.UserHandle.ALL); }
+        catch (Throwable t) { mContext.sendBroadcast(i); }
+        Slog.i(TAG, "delivered mesh message from " + sender + " (" + payload.length + "b)");
     }
 
     /** Current rotating BLE service UUID (daily; unguessable without the network key),
