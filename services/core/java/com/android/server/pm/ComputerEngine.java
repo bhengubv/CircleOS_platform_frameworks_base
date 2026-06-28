@@ -955,6 +955,32 @@ public class ComputerEngine implements Computer {
         return pkg;
     }
 
+    private void maybeSpoofSignatures(PackageInfo pi, PackageStateInternal ps) {
+        if (pi == null || pi.signatures == null || pi.signatures.length == 0) {
+            return;
+        }
+        final int callingUid = Binder.getCallingUid();
+        if (mContext.checkPermission("android.permission.FAKE_PACKAGE_SIGNATURE",
+                Binder.getCallingPid(), callingUid)
+                        != PackageManager.PERMISSION_GRANTED) {
+            return;
+        }
+        AndroidPackage pkg = ps.getPkg();
+        if (pkg == null) return;
+        android.os.Bundle metadata = pkg.getMetaData();
+        if (metadata == null) return;
+        String fakeSig = metadata.getString("fake-signature");
+        if (fakeSig == null || fakeSig.isEmpty()) return;
+        try {
+            pi.signatures = new android.content.pm.Signature[] {
+                new android.content.pm.Signature(fakeSig)
+            };
+        } catch (Exception e) {
+            android.util.Slog.w("ComputerEngine",
+                    "Invalid fake-signature in " + pi.packageName, e);
+        }
+    }
+
     public final ApplicationInfo generateApplicationInfoFromSettings(String packageName,
             long flags, int filterCallingUid, int userId) {
         if (!mUserManager.exists(userId)) return null;
@@ -1527,6 +1553,9 @@ public class ComputerEngine implements Computer {
             if (packageInfo == null) {
                 return null;
             }
+
+
+            maybeSpoofSignatures(packageInfo, ps);
 
             packageInfo.packageName = packageInfo.applicationInfo.packageName =
                     resolveExternalPackageName(p);

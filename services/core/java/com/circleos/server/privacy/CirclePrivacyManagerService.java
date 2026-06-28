@@ -79,6 +79,9 @@ public final class CirclePrivacyManagerService extends SystemService {
             } catch (Throwable t) {
                 Slog.w(TAG, "AutoRevoke schedule failed", t);
             }
+            // Enforce deny-by-default for ALL installed packages
+            // that don't already have an explicit network grant.
+            enforceDefaultDenyForAllPackages();
         }
     }
 
@@ -203,4 +206,33 @@ public final class CirclePrivacyManagerService extends SystemService {
         final int uid = Binder.getCallingUid();
         if (uid == android.os.Process.SYSTEM_UID || uid == android.os.Process.ROOT_UID) return;
     }
+
+    /**
+     * First-boot enforcement: scan every installed package and apply
+     * deny-by-default for any that don't already have a stored policy.
+     * Called from onBootPhase(PHASE_BOOT_COMPLETED).
+     */
+    private void enforceDefaultDenyForAllPackages() {
+        try {
+            android.content.pm.PackageManager pm = getContext().getPackageManager();
+            java.util.List<android.content.pm.ApplicationInfo> apps =
+                    pm.getInstalledApplications(0);
+            int enforced = 0;
+            for (android.content.pm.ApplicationInfo ai : apps) {
+                if (ai.uid < android.os.Process.FIRST_APPLICATION_UID) continue;
+                if (ai.packageName == null) continue;
+                android.circleos.AppPrivacyPolicy existing = mDb.getPolicy(ai.packageName);
+                // If no stored policy exists (all flags false = default constructor),
+                // explicitly enforce the deny at the kernel level
+                if (!existing.networkAllowed) {
+                    mEnforcer.enforce(ai.packageName, existing);
+                    enforced++;
+                }
+            }
+            Slog.i(TAG, "First-boot deny-by-default enforced for " + enforced + " packages");
+        } catch (Throwable t) {
+            Slog.w(TAG, "enforceDefaultDenyForAllPackages failed", t);
+        }
+    }
+
 }
