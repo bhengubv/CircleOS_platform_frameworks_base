@@ -114,11 +114,9 @@ public final class ShongololoWalletService extends SystemService {
     private String  mAddress;
     private String  mPubHex;
     private long    mCreatedAtMs;
-    private long    mAvailableCents;
-    private long    mPendingInCents;
-    private long    mPendingOutCents;
-    private long    mDailySpentCents;
-    private long    mDailyEpochDay;
+    /** Money state + arithmetic, unit-tested in WalletMathTest (21/21). */
+    private final WalletMath mMath =
+            new WalletMath(BASE_PER_TAP_CENTS, LOCK_PER_TAP_CENTS, BASE_DAILY_CENTS);
     private long    mLastSettlementMs;
     private final List<JSONObject> mTxs = new ArrayList<>();          // newest last
     private final List<JSONObject> mEvents = new ArrayList<>();       // protection events
@@ -194,10 +192,10 @@ public final class ShongololoWalletService extends SystemService {
             synchronized (mLock) {
                 rolloverDay();
                 WalletBalance b = new WalletBalance();
-                b.availableCents = mAvailableCents;
-                b.pendingInCents = mPendingInCents;
-                b.pendingOutCents = mPendingOutCents;
-                b.dailySpentCents = mDailySpentCents;
+                b.availableCents = mMath.available;
+                b.pendingInCents = mMath.pendingIn;
+                b.pendingOutCents = mMath.pendingOut;
+                b.dailySpentCents = mMath.dailySpent;
                 b.dailyLimitCents = BASE_DAILY_CENTS;
                 b.currency = CURRENCY;
                 return b;
@@ -276,13 +274,13 @@ public final class ShongololoWalletService extends SystemService {
             enforceQuery();
             synchronized (mLock) {
                 rolloverDay();
-                return Math.max(0, BASE_DAILY_CENTS - mDailySpentCents);
+                return mMath.dailyRemaining();
             }
         }
 
         @Override public long getOfflineAccumulationCents() {
             enforceQuery();
-            synchronized (mLock) { return mPendingOutCents + mPendingInCents; }
+            synchronized (mLock) { return mMath.pendingOut + mMath.pendingIn; }
         }
 
         @Override public void forceSyncNow() {
@@ -301,14 +299,14 @@ public final class ShongololoWalletService extends SystemService {
             synchronized (mLock) {
                 if (!mInitialised) return null;
                 rolloverDay();
-                long perTap = req.lockScreenMode ? LOCK_PER_TAP_CENTS : BASE_PER_TAP_CENTS;
-                if (req.amountCents > perTap) { logEvent(ProtectionEvent.TYPE_RATE_LIMIT,
-                        ProtectionEvent.SEVERITY_BLOCK, "over per-tap limit", req.amountCents); return null; }
-                if (req.amountCents > Math.max(0, BASE_DAILY_CENTS - mDailySpentCents)) {
-                    logEvent(ProtectionEvent.TYPE_RATE_LIMIT, ProtectionEvent.SEVERITY_BLOCK,
-                            "over daily limit", req.amountCents); return null; }
-                if (req.amountCents > mAvailableCents) { logEvent(ProtectionEvent.TYPE_AMOUNT_OUTLIER,
-                        ProtectionEvent.SEVERITY_WARN, "insufficient funds", req.amountCents); return null; }
+                String block = mMath.checkSend(req.amountCents, req.lockScreenMode, nowMs());
+                if (block != null) {
+                    boolean funds = "insufficient funds".equals(block);
+                    logEvent(funds ? ProtectionEvent.TYPE_AMOUNT_OUTLIER : ProtectionEvent.TYPE_RATE_LIMIT,
+                            funds ? ProtectionEvent.SEVERITY_WARN : ProtectionEvent.SEVERITY_BLOCK,
+                            block, req.amountCents);
+                    return null;
+                }
             }
             SenderSession s = new SenderSession();
             s.sid = newId("snd");
@@ -354,7 +352,7 @@ public final class ShongololoWalletService extends SystemService {
                         ShongololoTransaction.STATUS_PENDING_SETTLEMENT,
                         r.amountCents, r.senderPubHex, null, r.memo, "nfc");
                 mTxs.add(tx);
-                mPendingInCents += r.amountCents;
+                mMath.acceptRecv(r.amountCents);
                 saveLedger();
                 mReceiver = null;
                 queueSync();
@@ -362,7 +360,7 @@ public final class ShongololoWalletService extends SystemService {
                 res.success = true;
                 res.outcome = TransactionResult.OUTCOME_OK;
                 res.txId = jsonStr(tx, "txId");
-                res.newBalanceCents = mAvailableCents;
+                res.newBalanceCents = mMath.available;
                 return res;
             }
         }
@@ -405,7 +403,7 @@ public final class ShongololoWalletService extends SystemService {
                 a.totalSentCents = sent; a.totalReceivedCents = recv;
                 a.txCount = mTxs.size(); a.txSentCount = sc; a.txReceivedCount = rc;
                 a.avgSentCents = sc > 0 ? sent / sc : 0;
-                a.peakDaySpentCents = mDailySpentCents;
+                a.peakDaySpentCents = mMath.dailySpent;
                 a.blockedTxCount = mEvents.size();
                 return a;
             }
@@ -523,9 +521,7 @@ public final class ShongololoWalletService extends SystemService {
                     ShongololoTransaction.STATUS_PENDING_SETTLEMENT,
                     s.amountCents, s.receiverPubHex, null, s.memo, "nfc");
             mTxs.add(tx);
-            mAvailableCents = Math.max(0, mAvailableCents - s.amountCents);
-            mPendingOutCents += s.amountCents;
-            mDailySpentCents += s.amountCents;
+            mMath.finalizeSend(s.amountCents, nowMs());
             saveLedger();
             queueSync();
         }
@@ -533,8 +529,7 @@ public final class ShongololoWalletService extends SystemService {
 
     /** Canonical bytes signed over a transfer offer (receiver session + amount + memo). */
     private byte[] offerBytes(String rsid, long amt, String memo) {
-        return ("SDPKT|" + rsid + "|" + amt + "|" + (memo == null ? "" : memo))
-                .getBytes(StandardCharsets.UTF_8);
+        return WalletFrame.offerBytes(rsid, amt, memo);
     }
 
     private void broadcastIncoming(ReceiverSession r) {
@@ -592,10 +587,9 @@ public final class ShongololoWalletService extends SystemService {
             t.put("settledAtMs", nowMs());
             long amt = t.optLong("amt");
             if (t.optInt("type") == ShongololoTransaction.TYPE_SEND) {
-                mPendingOutCents = Math.max(0, mPendingOutCents - amt);
+                mMath.settleSend(amt);
             } else if (t.optInt("type") == ShongololoTransaction.TYPE_RECV) {
-                mPendingInCents = Math.max(0, mPendingInCents - amt);
-                mAvailableCents += amt;
+                mMath.settleRecv(amt);
             }
             mLastSettlementMs = nowMs();
             saveLedger();
@@ -709,11 +703,11 @@ public final class ShongololoWalletService extends SystemService {
             mAddress = o.optString("addr", null);
             mPubHex = o.optString("pub", null);
             mCreatedAtMs = o.optLong("created");
-            mAvailableCents = o.optLong("avail");
-            mPendingInCents = o.optLong("pin");
-            mPendingOutCents = o.optLong("pout");
-            mDailySpentCents = o.optLong("dspent");
-            mDailyEpochDay = o.optLong("dday");
+            mMath.available = o.optLong("avail");
+            mMath.pendingIn = o.optLong("pin");
+            mMath.pendingOut = o.optLong("pout");
+            mMath.dailySpent = o.optLong("dspent");
+            mMath.dailyEpochDay = o.optLong("dday");
             mLastSettlementMs = o.optLong("lastsettle");
             mFalsePositiveCount = o.optInt("fp");
             mTxs.clear();
@@ -732,11 +726,11 @@ public final class ShongololoWalletService extends SystemService {
             o.put("addr", mAddress);
             o.put("pub", mPubHex);
             o.put("created", mCreatedAtMs);
-            o.put("avail", mAvailableCents);
-            o.put("pin", mPendingInCents);
-            o.put("pout", mPendingOutCents);
-            o.put("dspent", mDailySpentCents);
-            o.put("dday", mDailyEpochDay);
+            o.put("avail", mMath.available);
+            o.put("pin", mMath.pendingIn);
+            o.put("pout", mMath.pendingOut);
+            o.put("dspent", mMath.dailySpent);
+            o.put("dday", mMath.dailyEpochDay);
             o.put("lastsettle", mLastSettlementMs);
             o.put("fp", mFalsePositiveCount);
             o.put("txs", new JSONArray(mTxs));
@@ -789,8 +783,7 @@ public final class ShongololoWalletService extends SystemService {
     }
 
     private void rolloverDay() {
-        long day = nowMs() / DAY_MS;
-        if (day != mDailyEpochDay) { mDailyEpochDay = day; mDailySpentCents = 0; }
+        mMath.rolloverDay(nowMs());
     }
 
     private void logEvent(int type, int sev, String reason, long amt) {
