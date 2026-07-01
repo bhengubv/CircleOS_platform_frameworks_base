@@ -583,8 +583,8 @@ public final class ShongololoWalletService extends SystemService {
 
     private void markSettled(JSONObject t) {
         synchronized (mLock) {
-            t.put("status", ShongololoTransaction.STATUS_SETTLED);
-            t.put("settledAtMs", nowMs());
+            jput(t, "status", ShongololoTransaction.STATUS_SETTLED);
+            jput(t, "settledAtMs", nowMs());
             long amt = t.optLong("amt");
             if (t.optInt("type") == ShongololoTransaction.TYPE_SEND) {
                 mMath.settleSend(amt);
